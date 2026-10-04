@@ -18,6 +18,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of back to front. The tails of letters such as ر and ز are no longer cut off at the bottom.
 - Arabic and Hebrew lyrics wrap at the right words, sit against the right edge, and the karaoke
   highlight sweeps from right to left.
+- Longer Arabic and Hebrew text, such as playlist descriptions and artist bios, wraps onto lines
+  that read in order.
+- Typing Arabic or Hebrew in the search box puts the caret and selection where they belong, and
+  the arrow keys move the caret the way they point.
 
 ## [0.42.1] - 2026-10-02
 
