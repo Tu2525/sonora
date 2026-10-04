@@ -15,7 +15,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Arabic, Hebrew and other right-to-left titles now read in the right order on Windows, instead
-  of back to front.
+  of back to front. The tails of letters such as ر and ز are no longer cut off at the bottom.
 
 ## [0.42.1] - 2026-10-02
 

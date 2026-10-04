@@ -17,7 +17,7 @@ use state::{
 };
 use ui::{
     ActiveTheme as _, Button, Card, DraggedPin, Edge, Motion, Motioned as _, Pin, Pinnable as _,
-    Popup, Scrollbar, Scroller, Spot, Springs, Text, Vacancy, drop_gap, drop_marker,
+    Popup, Scrollbar, Scroller, Spot, Springs, Tails as _, Text, Vacancy, drop_gap, drop_marker,
     ease_out_cubic, ease_out_expo, eyebrow, faint, mix, snapped, vacant,
 };
 
@@ -1853,6 +1853,7 @@ fn source_link(name: SharedString, to: Destination, cx: &App) -> impl IntoElemen
         .min_w_0()
         .flex_shrink(1.)
         .truncate()
+        .tails()
         .text_size(theme.text(Text::Small))
         .text_color(theme.muted_foreground)
         .font_weight(FontWeight::SEMIBOLD)
