@@ -12,6 +12,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Press F11 or double-click the fullscreen view to make the window fill the whole screen. Turn on
   Use OS fullscreen in settings to have the fullscreen button do the same.
 
+### Fixed
+
+- Arabic, Hebrew and other right-to-left titles now read in the right order on Windows, instead
+  of back to front.
+
 ## [0.42.1] - 2026-10-02
 
 ### Added
