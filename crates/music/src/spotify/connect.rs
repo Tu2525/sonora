@@ -620,11 +620,22 @@ async fn acknowledge(at: Option<Instant>) {
     }
 }
 
+/// The name the device goes by in Spotify's device list: Sonora and the computer it runs on, so
+/// two machines on one account tell apart.
+fn device_name() -> String {
+    let host = gethostname::gethostname();
+    let host = host.to_string_lossy();
+    match host.trim() {
+        "" => DEVICE_NAME.to_owned(),
+        host => format!("{DEVICE_NAME} ({host})"),
+    }
+}
+
 fn device_info(session: &Session) -> DeviceInfo {
     DeviceInfo {
         can_play: true,
         volume: u16::MAX as u32 / 2,
-        name: DEVICE_NAME.to_owned(),
+        name: device_name(),
         device_id: session.device_id().to_owned(),
         device_type: EnumOrUnknown::new(DeviceType::COMPUTER),
         device_software_version: SEMVER.to_string(),
