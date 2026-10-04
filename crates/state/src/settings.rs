@@ -279,6 +279,7 @@ struct Values {
     /// turning it back on restores the curve.
     equalizer_bands: Vec<f32>,
     sleep_timer: bool,
+    spotify_connect: bool,
     discord_presence: bool,
     discord_name: DiscordName,
     discord_show_paused: bool,
@@ -426,6 +427,7 @@ impl Default for Values {
             equalizer: false,
             equalizer_bands: vec![0.; equalizer::BANDS],
             sleep_timer: false,
+            spotify_connect: true,
             discord_presence: false,
             discord_name: DiscordName::Sonora,
             discord_show_paused: false,
@@ -737,6 +739,11 @@ impl AppSettings {
 
     pub fn sleep_timer(&self) -> bool {
         self.values.sleep_timer
+    }
+
+    /// Whether Sonora shows up as a Spotify Connect device while a Spotify account is signed in.
+    pub fn spotify_connect(&self) -> bool {
+        self.values.spotify_connect
     }
 
     /// Whether the playing track is published to a local Discord client.
@@ -1126,6 +1133,11 @@ impl AppSettings {
 
     pub fn set_sleep_timer(&mut self, sleep_timer: bool, cx: &mut Context<Self>) {
         self.values.sleep_timer = sleep_timer;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_spotify_connect(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.values.spotify_connect = enabled;
         self.schedule_save(cx);
     }
 
