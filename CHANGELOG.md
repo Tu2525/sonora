@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Sonora shows up as a device in Spotify, so Spotify and Discord show what you play in it.
+  Your phone can pause, skip, seek, change the volume and start music in Sonora.
+- A devices button in the player bar moves playback between Sonora and your other Spotify
+  devices and controls the one that is playing. It can be turned off in Settings.
+
 ## [0.42.2] - 2026-10-07
 
 ### Added

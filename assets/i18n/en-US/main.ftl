@@ -240,6 +240,10 @@ player-previous = Previous track
 player-next = Next track
 player-fullscreen = Fullscreen
 player-fullscreen-leave = Leave fullscreen
+player-devices = Devices
+devices-this-computer = This computer
+devices-pause = Pause
+devices-resume = Resume
 fullscreen-artwork = Artwork
 
 # filters
@@ -567,6 +571,8 @@ settings-close-to-tray = Keep running in the background
 settings-close-to-tray-detail = Keep Sonora running and playing after its window closes
 settings-tray-icon = Show in the system tray
 settings-tray-icon-detail = Put an icon with playback controls in the system tray
+settings-spotify-connect = Show as a Spotify device
+settings-spotify-connect-detail = List Sonora in the device picker of Spotify's apps, so you can control it from your phone and Spotify shows what you play
 settings-discord = Show on Discord
 settings-discord-detail = Put the track you are playing on your Discord profile
 settings-discord-name = Status name
@@ -700,6 +706,7 @@ settings-group-window-style = Window style
 settings-group-lyrics = Lyrics
 settings-group-equalizer = Equalizer
 settings-group-discord = Discord
+settings-group-spotify-connect = Spotify Connect
 settings-group-project = Project
 settings-adaptive-menu = Adaptive context menu
 settings-adaptive-menu-detail = Leaves out entries the row already shows, such as the album or the artist

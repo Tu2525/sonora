@@ -175,6 +175,7 @@ enum Slot {
     Romanized,
     LyricsForLocal,
     ArtworkForLocal,
+    SpotifyConnect,
     Discord,
     DiscordName,
     DiscordShowPaused,
@@ -638,8 +639,9 @@ impl SettingsView {
                 ]
             }
             SettingsTab::Integrations => self
-                .discord_slots(cx)
+                .connect_slots(cx)
                 .into_iter()
+                .chain(self.discord_slots(cx))
                 .chain([Slot::Title("settings-group-scrobbling")])
                 .chain(self.scrobble_slots(cx))
                 .collect(),
@@ -794,6 +796,10 @@ impl SettingsView {
             Slot::LyricsForLocal => (
                 t!("settings-lyrics-for-local-files"),
                 t!("settings-lyrics-for-local-files-detail"),
+            ),
+            Slot::SpotifyConnect => (
+                t!("settings-spotify-connect"),
+                t!("settings-spotify-connect-detail"),
             ),
             Slot::Discord => (t!("settings-discord"), t!("settings-discord-detail")),
             Slot::DiscordName => (
@@ -985,6 +991,7 @@ impl SettingsView {
             Slot::Karaoke => self.karaoke_lyrics_row(cx).element,
             Slot::Romanized => self.romanized_lyrics_row(cx).element,
             Slot::LyricsForLocal => self.lyrics_for_local_files_row(cx).element,
+            Slot::SpotifyConnect => self.spotify_connect_row(cx).element,
             Slot::Discord => self.discord_row(cx).element,
             Slot::DiscordName => self.discord_name_row(cx).element,
             Slot::DiscordShowPaused => self.discord_show_paused_row(cx).element,
@@ -2686,6 +2693,16 @@ impl SettingsView {
         )
     }
 
+    fn connect_slots(&self, cx: &App) -> Vec<Slot> {
+        match Sonora::global(cx).devices.read(cx).supported() {
+            true => vec![
+                Slot::Title("settings-group-spotify-connect"),
+                Slot::SpotifyConnect,
+            ],
+            false => Vec::new(),
+        }
+    }
+
     fn discord_slots(&self, cx: &App) -> Vec<Slot> {
         let mut slots = vec![Slot::Title("settings-group-discord"), Slot::Discord];
         if self.settings.read(cx).discord_presence() {
@@ -2696,6 +2713,26 @@ impl SettingsView {
             slots.push(Slot::DiscordButtons);
         }
         slots
+    }
+
+    fn spotify_connect_row(&self, cx: &mut Context<Self>) -> Setting {
+        let theme = *cx.theme();
+        let muted = theme.muted_foreground;
+        let small = theme.text(Text::Small);
+        let on = self.settings.read(cx).spotify_connect();
+
+        self.row(
+            t!("settings-spotify-connect"),
+            t!("settings-spotify-connect-detail"),
+            muted,
+            small,
+            Switch::new("spotify-connect", on)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.set_spotify_connect(!on, cx));
+                }))
+                .into_any_element(),
+        )
     }
 
     fn discord_row(&self, cx: &mut Context<Self>) -> Setting {

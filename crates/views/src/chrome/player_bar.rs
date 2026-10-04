@@ -17,6 +17,7 @@ use ui::{
 };
 
 use crate::chrome::SidebarRight;
+use crate::chrome::devices::DevicePicker;
 use crate::shared::menus::ItemMenu;
 use crate::shared::transport::{NOTCH, like, moved, percent, transport, volume_icon};
 
@@ -31,6 +32,7 @@ pub(crate) struct PlayerBar {
     queue: Entity<Queue>,
     settings: Entity<AppSettings>,
     track_menu: ItemMenu,
+    devices: Entity<DevicePicker>,
     context_menu: Option<(music::Track, Point<Pixels>)>,
     seek: ScrubberState,
     volume: ScrubberState,
@@ -58,6 +60,7 @@ impl PlayerBar {
             queue,
             settings,
             track_menu: ItemMenu::new(playlist_scrollbar, cx),
+            devices: cx.new(DevicePicker::new),
             context_menu: None,
             seek: ScrubberState::new("seek"),
             volume: ScrubberState::new("volume"),
@@ -213,6 +216,7 @@ impl PlayerBar {
             .flex_none()
             .items_center()
             .gap_1()
+            .child(self.devices.clone())
             .child(button(
                 "player-lyrics",
                 "icons/mic-vocal.svg",
