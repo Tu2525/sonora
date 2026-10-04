@@ -23,6 +23,20 @@ pub enum RepeatMode {
     Track,
 }
 
+/// How the app is named on the account's device list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Naming {
+    /// The app's name alone.
+    App,
+    /// The app's name and the computer's.
+    #[default]
+    AppOnComputer,
+    /// The computer's name alone.
+    Computer,
+    /// A name the listener chose. An empty one falls back to the app's name and the computer's.
+    Custom(String),
+}
+
 /// What the app is playing, in the terms a remote end can show. `track` and `upcoming` are
 /// provider track ids.
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +135,10 @@ pub trait Connect: Send + Sync {
     /// Shows this app on the account's device list, or takes it off. Nothing is announced and no
     /// connection is made until the first `true`.
     fn enable(&self, on: bool);
+
+    /// Changes the name the app goes by on the device list. A name typed in keystroke by keystroke
+    /// is fine, since the provider waits for it to settle.
+    fn rename(&self, naming: Naming);
 
     /// Reports what plays, or that nothing does. A report claims playback for this app, so only
     /// something the listener started should be sent.

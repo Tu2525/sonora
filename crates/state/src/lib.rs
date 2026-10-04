@@ -58,7 +58,7 @@ pub use scrobble::{ScrobbleRow, ScrobbleState, Scrobbling};
 pub use search::{AlbumHit, ArtistHit, Hit, Kind, PlaylistHit, Search};
 pub use session::{Failure, ProviderInfo, Session, SessionEvent, SessionState};
 pub use settings::{
-    AppSettings, DiscordName, FilterValue, FullscreenControlsAutohide, Reloaded,
+    AppSettings, ConnectName, DiscordName, FilterValue, FullscreenControlsAutohide, Reloaded,
     RomanizationScripts, SYSTEM_FONT, SideTab, remember_window, window_placement,
 };
 pub use song::SongDetail;
