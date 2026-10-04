@@ -6,13 +6,15 @@ use anyhow::Result;
 use futures::future::join_all;
 use gpui::{App, Context, Entity, Task};
 use music::connect::{
-    Collection, Command, Connect, Device, Elsewhere, Event, NowPlaying, RepeatMode, Roster, Start,
+    Collection, Command, Connect, Device, Elsewhere, Event, Naming, NowPlaying, RepeatMode, Roster,
+    Start,
 };
 use music::{MusicApi, Track};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
-    AppSettings, Io, Origin, Playback, Queue, Repeat, Session, SessionEvent, Whence, join,
+    AppSettings, ConnectName, Io, Origin, Playback, Queue, Repeat, Session, SessionEvent, Whence,
+    join,
 };
 
 /// How far the position may stray from where steady playback would have put it before it is
@@ -42,6 +44,8 @@ pub struct Devices {
     link: Option<Arc<dyn Connect>>,
     /// Whether this app is on the device list, as far as the link was told.
     shown: bool,
+    /// The name last handed to the link.
+    named: Option<Naming>,
     roster: Roster,
     /// The track playing on another device, once it is read in.
     remote: Option<Track>,
@@ -85,6 +89,7 @@ impl Devices {
             io,
             link: None,
             shown: false,
+            named: None,
             roster: Roster::default(),
             remote: None,
             claimed: false,
@@ -176,6 +181,7 @@ impl Devices {
         self.claimed = false;
         self.sent = None;
         self.shown = false;
+        self.named = None;
         self.link = link;
 
         if let Some(events) = self.link.as_ref().and_then(|link| link.events()) {
@@ -190,7 +196,20 @@ impl Devices {
         let Some(link) = self.link.clone() else {
             return;
         };
-        let wanted = self.settings.read(cx).spotify_connect();
+        let settings = self.settings.read(cx);
+        let wanted = settings.spotify_connect();
+        let naming = match settings.spotify_connect_name() {
+            ConnectName::Sonora => Naming::App,
+            ConnectName::Both => Naming::AppOnComputer,
+            ConnectName::Computer => Naming::Computer,
+            ConnectName::Custom => {
+                Naming::Custom(settings.spotify_connect_custom_name().to_owned())
+            }
+        };
+        if self.named.as_ref() != Some(&naming) {
+            link.rename(naming.clone());
+            self.named = Some(naming);
+        }
         if wanted == self.shown {
             return;
         }

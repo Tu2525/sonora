@@ -31,8 +31,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 
 use crate::connect::{
-    Collection, Command, Connect, Device, DeviceKind, Elsewhere, Event, NowPlaying, RepeatMode,
-    Roster, Start,
+    Collection, Command, Connect, Device, DeviceKind, Elsewhere, Event, Naming, NowPlaying,
+    RepeatMode, Roster, Start,
 };
 
 const DEVICE_NAME: &str = "Sonora";
@@ -48,10 +48,13 @@ const ACK_DELAY: Duration = Duration::from_millis(600);
 const CLAIM_GRACE: Duration = Duration::from_secs(3);
 /// The most upcoming tracks a start carries over from the device that sent it.
 const CARRIED: usize = 40;
+/// How long a new name settles before it is put, so a name typed in is put once.
+const RENAME_DELAY: Duration = Duration::from_millis(800);
 const VOLUME_STEPS: u32 = 64;
 
 enum Input {
     Enable(bool),
+    Rename(Naming),
     Publish(Option<NowPlaying>),
     Transfer(String),
     Control(String, Command),
@@ -84,6 +87,10 @@ impl Connection {
 impl Connect for Connection {
     fn enable(&self, on: bool) {
         self.inputs.send(Input::Enable(on)).ok();
+    }
+
+    fn rename(&self, naming: Naming) {
+        self.inputs.send(Input::Rename(naming)).ok();
     }
 
     fn publish(&self, now: Option<NowPlaying>) {
@@ -165,11 +172,12 @@ struct Worker {
     /// The id and sender of the last command handled, which the next state echoes back.
     last_command: (u32, String),
     ack_at: Option<Instant>,
+    rename_at: Option<Instant>,
 }
 
 impl Worker {
     fn new(session: Session, out: UnboundedSender<Event>) -> Self {
-        let info = device_info(&session);
+        let info = device_info(&session, &Naming::default());
         Self {
             session,
             out,
@@ -184,6 +192,7 @@ impl Worker {
             claimed_at: None,
             last_command: (0, String::new()),
             ack_at: None,
+            rename_at: None,
         }
     }
 
@@ -213,6 +222,12 @@ impl Worker {
                     Some(request) => self.request(request),
                     None => self.streams.commands = Box::pin(futures::stream::pending()),
                 },
+                () = acknowledge(self.rename_at) => {
+                    self.rename_at = None;
+                    if self.enabled && self.connected {
+                        self.announce().await;
+                    }
+                }
                 () = acknowledge(self.ack_at) => {
                     self.ack_at = None;
                     if self.now.is_some() {
@@ -231,6 +246,10 @@ impl Worker {
     async fn input(&mut self, input: Input) {
         match input {
             Input::Enable(on) => self.enable(on).await,
+            Input::Rename(naming) => {
+                self.info.name = device_name(&naming);
+                self.rename_at = Some(Instant::now() + RENAME_DELAY);
+            }
             Input::Publish(now) => self.publish(now).await,
             Input::Transfer(to) => {
                 // the same id on both ends asks Spotify to move playback from whichever device
@@ -620,22 +639,24 @@ async fn acknowledge(at: Option<Instant>) {
     }
 }
 
-/// The name the device goes by in Spotify's device list: Sonora and the computer it runs on, so
-/// two machines on one account tell apart.
-fn device_name() -> String {
+/// The name the device goes by in Spotify's device list.
+fn device_name(naming: &Naming) -> String {
     let host = gethostname::gethostname();
     let host = host.to_string_lossy();
-    match host.trim() {
-        "" => DEVICE_NAME.to_owned(),
-        host => format!("{DEVICE_NAME} ({host})"),
+    let host = host.trim();
+    match (naming, host) {
+        (Naming::Custom(name), _) if !name.trim().is_empty() => name.trim().to_owned(),
+        (Naming::App, _) | (_, "") => DEVICE_NAME.to_owned(),
+        (Naming::Computer, host) => host.to_owned(),
+        (Naming::AppOnComputer | Naming::Custom(_), host) => format!("{DEVICE_NAME} ({host})"),
     }
 }
 
-fn device_info(session: &Session) -> DeviceInfo {
+fn device_info(session: &Session, naming: &Naming) -> DeviceInfo {
     DeviceInfo {
         can_play: true,
         volume: u16::MAX as u32 / 2,
-        name: device_name(),
+        name: device_name(naming),
         device_id: session.device_id().to_owned(),
         device_type: EnumOrUnknown::new(DeviceType::COMPUTER),
         device_software_version: SEMVER.to_string(),
