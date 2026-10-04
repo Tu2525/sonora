@@ -1,0 +1,814 @@
+//! Sonora as a Spotify Connect device. It tells Spotify what plays, so Spotify's apps and
+//! Discord show it, takes the commands their controls send, and lists and drives the account's
+//! other devices.
+//!
+//! librespot's own `Spirc` does the same but wants to own the queue, so this speaks the same
+//! protocol straight through the session's dealer and spclient and leaves the queue to Sonora.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use futures::StreamExt as _;
+use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
+use librespot_core::dealer::manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply};
+use librespot_core::dealer::protocol::{Command as Wire, Message, PlayCommand};
+use librespot_core::version::{SEMVER, SPOTIFY_SPIRC_VERSION};
+use librespot_core::{Error, Session};
+use librespot_protocol::connect::{
+    Capabilities, Cluster, ClusterUpdate, Device as WireDevice, DeviceInfo, MemberType,
+    PutStateReason, PutStateRequest, SetVolumeCommand,
+};
+use librespot_protocol::devices::DeviceType;
+use librespot_protocol::media::AudioQuality;
+use librespot_protocol::player::{
+    ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
+};
+use librespot_protocol::transfer_state::TransferState;
+use protobuf::{EnumOrUnknown, Message as _, MessageField};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::time::Instant;
+
+use crate::connect::{
+    Collection, Command, Connect, Device, DeviceKind, Elsewhere, Event, NowPlaying, RepeatMode,
+    Roster, Start,
+};
+
+const DEVICE_NAME: &str = "Sonora";
+const TRACK_PREFIX: &str = "spotify:track:";
+/// The context a state names when it has none, which Spotify needs to see to keep the device
+/// active.
+const UNKNOWN_CONTEXT: &str = "spotify:unknown";
+/// How long a command waits for the app to act on it before the state is put regardless, so the
+/// device that sent it always hears that it was handled.
+const ACK_DELAY: Duration = Duration::from_millis(600);
+/// How long after claiming playback a report of another active device is taken to be older than
+/// the claim.
+const CLAIM_GRACE: Duration = Duration::from_secs(3);
+/// The most upcoming tracks a start carries over from the device that sent it.
+const CARRIED: usize = 40;
+const VOLUME_STEPS: u32 = 64;
+
+enum Input {
+    Enable(bool),
+    Publish(Option<NowPlaying>),
+    Transfer(String),
+    Control(String, Command),
+}
+
+/// The handle the app holds. The work happens on a task of the session's runtime, which ends
+/// when this is dropped.
+pub struct Connection {
+    device: String,
+    inputs: UnboundedSender<Input>,
+    events: Mutex<Option<UnboundedReceiver<Event>>>,
+}
+
+impl Connection {
+    /// Prepares the device on `session`. Nothing leaves the machine until `enable(true)`.
+    pub fn new(session: Session) -> Self {
+        let (inputs, receiver) = unbounded_channel();
+        let (out, events) = unbounded_channel();
+        let device = session.device_id().to_owned();
+        let worker = Worker::new(session.clone(), out);
+        session.spawn(worker.run(receiver));
+        Self {
+            device,
+            inputs,
+            events: Mutex::new(Some(events)),
+        }
+    }
+}
+
+impl Connect for Connection {
+    fn enable(&self, on: bool) {
+        self.inputs.send(Input::Enable(on)).ok();
+    }
+
+    fn publish(&self, now: Option<NowPlaying>) {
+        self.inputs.send(Input::Publish(now)).ok();
+    }
+
+    fn events(&self) -> Option<UnboundedReceiver<Event>> {
+        self.events.lock().ok()?.take()
+    }
+
+    fn device(&self) -> String {
+        self.device.clone()
+    }
+
+    fn transfer(&self, to: &str) {
+        self.inputs.send(Input::Transfer(to.to_owned())).ok();
+    }
+
+    fn control(&self, device: &str, command: Command) {
+        self.inputs
+            .send(Input::Control(device.to_owned(), command))
+            .ok();
+    }
+}
+
+/// What the dealer hands the worker: the connection id Spotify gave this session, changes to the
+/// account's devices, volume requests, and playback commands.
+struct Streams {
+    connection_ids: BoxedStreamResult<String>,
+    clusters: BoxedStreamResult<ClusterUpdate>,
+    volumes: BoxedStreamResult<SetVolumeCommand>,
+    commands: BoxedStream<RequestReply>,
+}
+
+impl Streams {
+    /// Streams that never yield, for the time before the dealer is started and after one ends.
+    fn idle() -> Self {
+        Self {
+            connection_ids: Box::pin(futures::stream::pending()),
+            clusters: Box::pin(futures::stream::pending()),
+            volumes: Box::pin(futures::stream::pending()),
+            commands: Box::pin(futures::stream::pending()),
+        }
+    }
+
+    /// Subscribes to everything the device listens to. This has to happen before the dealer
+    /// starts, because starting it closes the list.
+    fn subscribe(session: &Session) -> Result<Self, Error> {
+        let dealer = session.dealer();
+        Ok(Self {
+            connection_ids: dealer.listen_for("hm://pusher/v1/connections/", |message| {
+                message
+                    .headers
+                    .get("Spotify-Connection-Id")
+                    .cloned()
+                    .ok_or_else(|| Error::failed_precondition("no connection id in the message"))
+            })?,
+            clusters: dealer.listen_for("hm://connect-state/v1/cluster", Message::from_raw)?,
+            volumes: dealer
+                .listen_for("hm://connect-state/v1/connect/volume", Message::from_raw)?,
+            commands: dealer.handle_for("hm://connect-state/v1/player/command")?,
+        })
+    }
+}
+
+struct Worker {
+    session: Session,
+    out: UnboundedSender<Event>,
+    info: DeviceInfo,
+    streams: Streams,
+    enabled: bool,
+    /// The dealer is started once and cannot be restarted on the same session.
+    started: bool,
+    connected: bool,
+    now: Option<NowPlaying>,
+    active: bool,
+    active_since: Option<SystemTime>,
+    claimed_at: Option<Instant>,
+    /// The id and sender of the last command handled, which the next state echoes back.
+    last_command: (u32, String),
+    ack_at: Option<Instant>,
+}
+
+impl Worker {
+    fn new(session: Session, out: UnboundedSender<Event>) -> Self {
+        let info = device_info(&session);
+        Self {
+            session,
+            out,
+            info,
+            streams: Streams::idle(),
+            enabled: false,
+            started: false,
+            connected: false,
+            now: None,
+            active: false,
+            active_since: None,
+            claimed_at: None,
+            last_command: (0, String::new()),
+            ack_at: None,
+        }
+    }
+
+    async fn run(mut self, mut inputs: UnboundedReceiver<Input>) {
+        loop {
+            tokio::select! {
+                input = inputs.recv() => {
+                    let Some(input) = input else { break };
+                    self.input(input).await;
+                }
+                id = self.streams.connection_ids.next() => match id {
+                    Some(Ok(id)) => self.connection_id(id).await,
+                    Some(Err(error)) => log::warn!("connect: bad connection id message: {error}"),
+                    None => self.streams.connection_ids = Box::pin(futures::stream::pending()),
+                },
+                update = self.streams.clusters.next() => match update {
+                    Some(Ok(update)) => self.cluster(update),
+                    Some(Err(error)) => log::warn!("connect: bad cluster update: {error}"),
+                    None => self.streams.clusters = Box::pin(futures::stream::pending()),
+                },
+                volume = self.streams.volumes.next() => match volume {
+                    Some(Ok(volume)) => self.volume(volume),
+                    Some(Err(error)) => log::warn!("connect: bad volume request: {error}"),
+                    None => self.streams.volumes = Box::pin(futures::stream::pending()),
+                },
+                request = self.streams.commands.next() => match request {
+                    Some(request) => self.request(request),
+                    None => self.streams.commands = Box::pin(futures::stream::pending()),
+                },
+                () = acknowledge(self.ack_at) => {
+                    self.ack_at = None;
+                    if self.now.is_some() {
+                        self.put(PutStateReason::PLAYER_STATE_CHANGED).await;
+                    }
+                }
+            }
+        }
+
+        // the dealer's socket closing is what takes the device off the account's list
+        if self.started {
+            self.session.dealer().close().await;
+        }
+    }
+
+    async fn input(&mut self, input: Input) {
+        match input {
+            Input::Enable(on) => self.enable(on).await,
+            Input::Publish(now) => self.publish(now).await,
+            Input::Transfer(to) => {
+                // the same id on both ends asks Spotify to move playback from whichever device
+                // has it
+                if let Err(error) = self.session.spclient().transfer(&to, &to, None).await {
+                    log::warn!("connect: cannot transfer playback: {error}");
+                }
+            }
+            Input::Control(device, command) => {
+                control(self.session.clone(), &device, command).await
+            }
+        }
+    }
+
+    async fn enable(&mut self, on: bool) {
+        if self.enabled == on {
+            return;
+        }
+        self.enabled = on;
+        match (on, self.started) {
+            (true, false) => self.start().await,
+            (true, true) if self.connected => self.announce().await,
+            (true, true) => {}
+            (false, _) => self.withdraw().await,
+        }
+    }
+
+    async fn start(&mut self) {
+        self.started = true;
+        match Streams::subscribe(&self.session) {
+            Ok(streams) => self.streams = streams,
+            Err(error) => return log::warn!("connect: cannot listen to the dealer: {error}"),
+        }
+        if let Err(error) = self.session.dealer().start().await {
+            self.streams = Streams::idle();
+            log::warn!("connect: cannot start the dealer: {error}");
+        }
+    }
+
+    /// The dealer's first message carries the connection id Spotify files this session under,
+    /// and the device can only be announced once it is known.
+    async fn connection_id(&mut self, id: String) {
+        self.session.set_connection_id(&id);
+        self.connected = true;
+        if self.enabled {
+            self.announce().await;
+        }
+    }
+
+    async fn announce(&mut self) {
+        let Some(cluster) = self.put(PutStateReason::NEW_DEVICE).await else {
+            return;
+        };
+        self.out.send(Event::Roster(self.roster(&cluster))).ok();
+        // something may have been playing before the device was listed
+        if self.now.is_some() {
+            self.sync(None).await;
+        }
+    }
+
+    async fn withdraw(&mut self) {
+        self.active = false;
+        self.active_since = None;
+        self.out.send(Event::Roster(Roster::default())).ok();
+        if !self.connected {
+            return;
+        }
+        if let Err(error) = self.session.spclient().delete_connect_state_request().await {
+            log::warn!("connect: cannot leave the device list: {error}");
+        }
+    }
+
+    async fn publish(&mut self, now: Option<NowPlaying>) {
+        let before = std::mem::replace(&mut self.now, now);
+        self.sync(before).await;
+    }
+
+    /// Puts the state the device is in now, given what it reported `before`.
+    async fn sync(&mut self, before: Option<NowPlaying>) {
+        if !self.enabled || !self.connected {
+            return;
+        }
+        let Some(now) = self.now.clone() else {
+            if self.active {
+                self.active = false;
+                self.active_since = None;
+                if let Err(error) = self
+                    .session
+                    .spclient()
+                    .put_connect_state_inactive(false)
+                    .await
+                {
+                    log::warn!("connect: cannot go inactive: {error}");
+                }
+            }
+            return;
+        };
+
+        if !self.active {
+            self.active = true;
+            self.active_since = Some(SystemTime::now());
+            self.claimed_at = Some(Instant::now());
+        }
+        let only_volume = before.is_some_and(|before| {
+            let mut same = before;
+            same.volume = now.volume;
+            same == now
+        });
+        let reason = match only_volume {
+            true => PutStateReason::VOLUME_CHANGED,
+            false => PutStateReason::PLAYER_STATE_CHANGED,
+        };
+        self.put(reason).await;
+    }
+
+    /// Puts the device's state and returns the account's devices as Spotify answers it.
+    async fn put(&mut self, reason: PutStateReason) -> Option<Cluster> {
+        let request = self.request_for(reason);
+        let answer = self
+            .session
+            .spclient()
+            .put_connect_state_request(&request)
+            .await;
+        match answer {
+            Ok(bytes) => Cluster::parse_from_bytes(&bytes).ok(),
+            Err(error) => {
+                log::warn!("connect: cannot put the state: {error}");
+                None
+            }
+        }
+    }
+
+    fn request_for(&self, reason: PutStateReason) -> PutStateRequest {
+        let stamp = unix_millis();
+        let mut info = self.info.clone();
+        if let Some(now) = &self.now {
+            info.volume = volume_word(now.volume);
+        }
+        PutStateRequest {
+            member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
+            put_state_reason: EnumOrUnknown::new(reason),
+            is_active: self.active && self.now.is_some(),
+            started_playing_at: self.active_since.map(millis).unwrap_or_default(),
+            client_side_timestamp: stamp,
+            last_command_message_id: self.last_command.0,
+            last_command_sent_by_device_id: self.last_command.1.clone(),
+            device: MessageField::some(WireDevice {
+                device_info: MessageField::some(info),
+                player_state: MessageField::some(self.player_state(stamp)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn player_state(&self, stamp: u64) -> PlayerState {
+        let mut state = PlayerState {
+            session_id: self.session.session_id(),
+            is_system_initiated: true,
+            playback_speed: 1.,
+            play_origin: MessageField::some(PlayOrigin::new()),
+            suppressions: MessageField::some(Suppressions::new()),
+            options: MessageField::some(ContextPlayerOptions::new()),
+            context_uri: UNKNOWN_CONTEXT.to_owned(),
+            context_url: format!("context://{UNKNOWN_CONTEXT}"),
+            ..Default::default()
+        };
+        let Some(now) = &self.now else {
+            return state;
+        };
+
+        let uri = self.context_uri(now.context.as_ref());
+        state.context_url = format!("context://{uri}");
+        state.context_uri = uri;
+        state.track = MessageField::some(provided(&now.track, 0));
+        state.index = MessageField::some(ContextIndex::new());
+        state.timestamp = stamp as i64;
+        state.position_as_of_timestamp = now.position.as_millis() as i64;
+        state.duration = now.duration.as_millis() as i64;
+        state.options = MessageField::some(ContextPlayerOptions {
+            shuffling_context: now.shuffle,
+            repeating_context: now.repeat == RepeatMode::Context,
+            repeating_track: now.repeat == RepeatMode::Track,
+            ..Default::default()
+        });
+        state.next_tracks = now
+            .upcoming
+            .iter()
+            .enumerate()
+            .map(|(at, id)| provided(id, at + 1))
+            .collect();
+        let mut hasher = DefaultHasher::new();
+        state
+            .next_tracks
+            .iter()
+            .for_each(|track| track.uri.hash(&mut hasher));
+        state.queue_revision = hasher.finish().to_string();
+
+        // desktop and mobile apps want every flag set while paused, or their play button greys out
+        match now.playing {
+            true => {
+                state.is_playing = true;
+                state.is_paused = false;
+                state.is_buffering = false;
+            }
+            false => {
+                state.is_playing = true;
+                state.is_paused = true;
+                state.is_buffering = true;
+                state.playback_speed = 0.;
+            }
+        }
+        state
+    }
+
+    fn context_uri(&self, context: Option<&Collection>) -> String {
+        match context {
+            Some(Collection::Album(id)) => format!("spotify:album:{id}"),
+            Some(Collection::Playlist(id)) => format!("spotify:playlist:{id}"),
+            Some(Collection::Saved) => {
+                format!("spotify:user:{}:collection", self.session.username())
+            }
+            None => UNKNOWN_CONTEXT.to_owned(),
+        }
+    }
+
+    fn cluster(&mut self, update: ClusterUpdate) {
+        let Some(cluster) = update.cluster.as_ref() else {
+            return;
+        };
+        let mine = self.session.device_id();
+        let elsewhere = !cluster.active_device_id.is_empty() && cluster.active_device_id != mine;
+        let fresh = self
+            .claimed_at
+            .is_none_or(|claimed| claimed.elapsed() > CLAIM_GRACE);
+        if self.active && elsewhere && fresh {
+            self.active = false;
+            self.active_since = None;
+            self.out.send(Event::Command(Command::Released)).ok();
+        }
+        self.out.send(Event::Roster(self.roster(cluster))).ok();
+    }
+
+    fn roster(&self, cluster: &Cluster) -> Roster {
+        let mine = self.session.device_id();
+        let known = |id: &str, info: &DeviceInfo| Device {
+            id: id.to_owned(),
+            name: info.name.clone(),
+            kind: kind(info),
+            volume: info.volume as f32 / u16::MAX as f32,
+        };
+
+        let mut devices = cluster
+            .device
+            .iter()
+            .filter(|(id, info)| id.as_str() != mine && info.can_play && !info.capabilities.hidden)
+            .map(|(id, info)| known(id, info))
+            .collect::<Vec<_>>();
+        devices.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+        let elsewhere = cluster
+            .device
+            .get(&cluster.active_device_id)
+            .filter(|_| cluster.active_device_id != mine)
+            .map(|info| {
+                let state = &cluster.player_state;
+                Elsewhere {
+                    device: known(&cluster.active_device_id, info),
+                    track: track_id(&state.track.uri),
+                    playing: state.is_playing && !state.is_paused,
+                }
+            });
+        Roster { devices, elsewhere }
+    }
+
+    fn volume(&mut self, command: SetVolumeCommand) {
+        let level = command.volume.clamp(0, u16::MAX as i32) as f32 / u16::MAX as f32;
+        self.out.send(Event::Command(Command::Volume(level))).ok();
+    }
+
+    fn request(&mut self, (request, reply): RequestReply) {
+        self.last_command = (request.message_id, request.sent_by_device_id.clone());
+        let commands = self.translate(request.command);
+        let verdict = match &commands {
+            Some(_) => Reply::Success,
+            None => Reply::Failure,
+        };
+        for command in commands.into_iter().flatten() {
+            self.out.send(Event::Command(command)).ok();
+        }
+        reply.send(verdict).ok();
+        self.ack_at = Some(Instant::now() + ACK_DELAY);
+    }
+
+    /// What a command from Spotify asks of the app, or `None` for one this device does not
+    /// know.
+    fn translate(&self, command: Wire) -> Option<Vec<Command>> {
+        Some(match command {
+            Wire::Transfer(transfer) => vec![Command::Start(started_by_transfer(transfer.data?))],
+            Wire::Play(play) => vec![Command::Start(started_by_play(&play))],
+            Wire::Pause(_) => vec![Command::Pause],
+            Wire::Resume(_) => vec![Command::Play],
+            Wire::SkipNext(_) => vec![Command::Next],
+            Wire::SkipPrev(_) => vec![Command::Previous],
+            Wire::SeekTo(seek) => vec![Command::Seek(Duration::from_millis(seek.value.into()))],
+            Wire::SetShufflingContext(set) => vec![Command::Shuffle(set.value)],
+            Wire::SetRepeatingContext(set) => {
+                vec![Command::Repeat(self.repeat(Some(set.value), None))]
+            }
+            Wire::SetRepeatingTrack(set) => {
+                vec![Command::Repeat(self.repeat(None, Some(set.value)))]
+            }
+            Wire::SetOptions(options) => {
+                let mut commands = Vec::new();
+                if let Some(on) = options.shuffling_context {
+                    commands.push(Command::Shuffle(on));
+                }
+                if options.repeating_context.is_some() || options.repeating_track.is_some() {
+                    commands.push(Command::Repeat(
+                        self.repeat(options.repeating_context, options.repeating_track),
+                    ));
+                }
+                commands
+            }
+            Wire::AddToQueue(add) => track_id(&add.track.uri)
+                .map(Command::Enqueue)
+                .into_iter()
+                .collect(),
+            // the app keeps its own queue, which it reports back with the next state
+            Wire::SetQueue(_) | Wire::UpdateContext(_) => Vec::new(),
+            Wire::Unknown(_) => return None,
+        })
+    }
+
+    /// The repeat mode after a request to switch the context or the track repeat, each of which
+    /// leaves the other as it is.
+    fn repeat(&self, context: Option<bool>, track: Option<bool>) -> RepeatMode {
+        let current = self.now.as_ref().map(|now| now.repeat).unwrap_or_default();
+        match (context, track) {
+            (_, Some(true)) => RepeatMode::Track,
+            (Some(true), _) => RepeatMode::Context,
+            (Some(false), _) if current == RepeatMode::Context => RepeatMode::Off,
+            (_, Some(false)) if current == RepeatMode::Track => RepeatMode::Off,
+            _ => current,
+        }
+    }
+}
+
+/// Sends a command to another device of the account through the session.
+async fn control(session: Session, device: &str, command: Command) {
+    let mine = session.device_id();
+    let (method, endpoint, body) = match command {
+        Command::Volume(level) => (
+            Method::PUT,
+            format!("/connect-state/v1/connect/volume/from/{mine}/to/{device}"),
+            serde_json::json!({ "volume": volume_word(level) }),
+        ),
+        command => {
+            let Some(command) = wire_command(&command) else {
+                return;
+            };
+            (
+                Method::POST,
+                format!("/connect-state/v1/player/command/from/{mine}/to/{device}"),
+                serde_json::json!({ "command": command }),
+            )
+        }
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let body = body.to_string();
+    let answer = session
+        .spclient()
+        .request(&method, &endpoint, Some(headers), Some(body.as_bytes()))
+        .await;
+    if let Err(error) = answer {
+        log::warn!("connect: cannot control {device}: {error}");
+    }
+}
+
+/// Resolves when the time for a pending acknowledgement comes, and never when there is none.
+async fn acknowledge(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn device_info(session: &Session) -> DeviceInfo {
+    DeviceInfo {
+        can_play: true,
+        volume: u16::MAX as u32 / 2,
+        name: DEVICE_NAME.to_owned(),
+        device_id: session.device_id().to_owned(),
+        device_type: EnumOrUnknown::new(DeviceType::COMPUTER),
+        device_software_version: SEMVER.to_string(),
+        spirc_version: SPOTIFY_SPIRC_VERSION.to_string(),
+        client_id: session.client_id(),
+        capabilities: MessageField::some(Capabilities {
+            volume_steps: VOLUME_STEPS as i32,
+            gaia_eq_connect_id: true,
+            can_be_player: true,
+            needs_full_player_state: true,
+            is_observable: true,
+            is_controllable: true,
+            supports_gzip_pushes: true,
+            supported_types: vec![
+                "audio/episode".into(),
+                "audio/track".into(),
+                "audio/local".into(),
+            ],
+            supports_playlist_v2: true,
+            supports_transfer_command: true,
+            supports_command_request: true,
+            supports_set_options_command: true,
+            supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
+            command_acks: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A command for another device in the JSON the player command endpoint takes.
+fn wire_command(command: &Command) -> Option<serde_json::Value> {
+    Some(match command {
+        Command::Play => serde_json::json!({ "endpoint": "resume" }),
+        Command::Pause => serde_json::json!({ "endpoint": "pause" }),
+        Command::Next => serde_json::json!({ "endpoint": "skip_next" }),
+        Command::Previous => serde_json::json!({ "endpoint": "skip_prev" }),
+        Command::Seek(at) => {
+            serde_json::json!({ "endpoint": "seek_to", "value": at.as_millis() as u64 })
+        }
+        Command::Shuffle(on) => {
+            serde_json::json!({ "endpoint": "set_shuffling_context", "value": on })
+        }
+        _ => return None,
+    })
+}
+
+fn kind(info: &DeviceInfo) -> DeviceKind {
+    match info.device_type.enum_value() {
+        Ok(DeviceType::COMPUTER | DeviceType::CHROMEBOOK) => DeviceKind::Computer,
+        Ok(DeviceType::SMARTPHONE | DeviceType::SMARTWATCH) => DeviceKind::Phone,
+        Ok(DeviceType::TABLET) => DeviceKind::Tablet,
+        Ok(
+            DeviceType::SPEAKER
+            | DeviceType::AVR
+            | DeviceType::AUDIO_DONGLE
+            | DeviceType::CAST_AUDIO
+            | DeviceType::HOME_THING,
+        ) => DeviceKind::Speaker,
+        Ok(DeviceType::TV | DeviceType::STB | DeviceType::CAST_VIDEO) => DeviceKind::Tv,
+        Ok(DeviceType::GAME_CONSOLE) => DeviceKind::Console,
+        Ok(DeviceType::AUTOMOBILE | DeviceType::CAR_THING) => DeviceKind::Car,
+        _ => DeviceKind::Other,
+    }
+}
+
+/// A track as the player state lists it. Spotify's apps look the track up by its uri.
+fn provided(id: &str, at: usize) -> ProvidedTrack {
+    ProvidedTrack {
+        uri: format!("{TRACK_PREFIX}{id}"),
+        uid: format!("sonora{at}"),
+        provider: "context".to_owned(),
+        ..Default::default()
+    }
+}
+
+fn track_id(uri: &str) -> Option<String> {
+    uri.strip_prefix(TRACK_PREFIX)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+/// The album, playlist or saved tracks a context uri names. Anything else, such as an artist or
+/// a radio, has no collection to read back.
+fn collection(uri: &str) -> Option<Collection> {
+    let parts = uri.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["spotify", "album", id] => Some(Collection::Album((*id).to_owned())),
+        ["spotify", "playlist", id] | ["spotify", "user", _, "playlist", id] => {
+            Some(Collection::Playlist((*id).to_owned()))
+        }
+        ["spotify", "user", _, "collection"] => Some(Collection::Saved),
+        _ => None,
+    }
+}
+
+/// Where a transfer from another device leaves off: its track, how far in, and what follows.
+fn started_by_transfer(state: TransferState) -> Start {
+    let playback = &state.playback;
+    let paused = playback.is_paused.unwrap_or_default();
+    let mut position = playback.position_as_of_timestamp.unwrap_or_default().max(0) as u64;
+    if let (false, Some(stamp)) = (paused, playback.timestamp) {
+        // the position was true when the timestamp was taken, and the music went on since
+        position += (unix_millis() as i64 - stamp).clamp(0, 60_000) as u64;
+    }
+
+    let from_queue = state.queue.is_playing_queue.unwrap_or_default();
+    let current = match from_queue {
+        true => state.queue.tracks.first(),
+        false => playback.current_track.as_ref(),
+    };
+    let track = current
+        .and_then(|track| track.uri.as_deref())
+        .and_then(track_id);
+
+    let context = &state.current_session.context;
+    let queued = state
+        .queue
+        .tracks
+        .iter()
+        .skip(from_queue as usize)
+        .filter_map(|track| track.uri.as_deref().and_then(track_id));
+    let following = context
+        .pages
+        .iter()
+        .flat_map(|page| page.tracks.iter())
+        .filter_map(|track| track.uri.as_deref().and_then(track_id))
+        .skip_while(|id| Some(id) != track.as_ref())
+        .skip(1);
+
+    Start {
+        collection: context.uri.as_deref().and_then(collection),
+        upcoming: queued.chain(following).take(CARRIED).collect(),
+        track,
+        position: Duration::from_millis(position),
+        paused,
+    }
+}
+
+/// What a play command from another device asks for.
+fn started_by_play(play: &PlayCommand) -> Start {
+    let listed = play
+        .context
+        .pages
+        .iter()
+        .flat_map(|page| page.tracks.iter())
+        .filter_map(|track| track.uri.as_deref().and_then(track_id))
+        .collect::<Vec<_>>();
+
+    let skip = play.options.skip_to.as_ref();
+    let track = skip
+        .and_then(|skip| skip.track_uri.as_deref())
+        .and_then(track_id)
+        .or_else(|| {
+            let index = skip.and_then(|skip| skip.track_index)? as usize;
+            listed.get(index).cloned()
+        });
+    let upcoming = listed
+        .into_iter()
+        .skip_while(|id| Some(id) != track.as_ref())
+        .skip(1)
+        .take(CARRIED)
+        .collect();
+
+    Start {
+        collection: play.context.uri.as_deref().and_then(collection),
+        track,
+        upcoming,
+        position: Duration::from_millis(play.options.seek_to.unwrap_or_default().into()),
+        paused: play.options.initially_paused.unwrap_or_default(),
+    }
+}
+
+/// A volume from 0 to 1 on Spotify's 16-bit scale.
+fn volume_word(level: f32) -> u32 {
+    (level.clamp(0., 1.) * u16::MAX as f32).round() as u32
+}
+
+fn unix_millis() -> u64 {
+    millis(SystemTime::now())
+}
+
+fn millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
