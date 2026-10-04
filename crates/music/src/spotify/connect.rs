@@ -181,6 +181,8 @@ struct Worker {
     last_command: (u32, String),
     ack_at: Option<Instant>,
     rename_at: Option<Instant>,
+    /// The device that has playback on the account, as the last cluster said.
+    active_device: String,
     /// The reason of a put that is due but held back, and when it may go out.
     pending: Option<PutStateReason>,
     flush_at: Option<Instant>,
@@ -207,6 +209,7 @@ impl Worker {
             last_command: (0, String::new()),
             ack_at: None,
             rename_at: None,
+            active_device: String::new(),
             pending: None,
             flush_at: None,
             last_put: None,
@@ -272,10 +275,15 @@ impl Worker {
             }
             Input::Publish(now) => self.publish(now).await,
             Input::Transfer(to) => {
-                // the same id on both ends asks Spotify to move playback from whichever device
-                // has it
-                if let Err(error) = self.session.spclient().transfer(&to, &to, None).await {
-                    log::warn!("connect: cannot transfer playback: {error}");
+                // playback moves from the device that has it, which this app knows when it is
+                // that device itself or when the last cluster named one
+                let from = match (self.active, self.active_device.is_empty()) {
+                    (true, _) => self.session.device_id().to_owned(),
+                    (false, false) => self.active_device.clone(),
+                    (false, true) => to.clone(),
+                };
+                if let Err(error) = self.session.spclient().transfer(&from, &to, None).await {
+                    log::warn!("connect: cannot move playback from {from} to {to}: {error}");
                 }
             }
             Input::Control(device, command) => {
@@ -323,6 +331,7 @@ impl Worker {
         let Some(cluster) = self.put(PutStateReason::NEW_DEVICE).await else {
             return;
         };
+        self.active_device = cluster.active_device_id.clone();
         self.out.send(Event::Roster(self.roster(&cluster))).ok();
         // something may have been playing before the device was listed
         if self.now.is_some() {
@@ -556,6 +565,7 @@ impl Worker {
         let fresh = self
             .claimed_at
             .is_none_or(|claimed| claimed.elapsed() > CLAIM_GRACE);
+        self.active_device = cluster.active_device_id.clone();
         if self.active && elsewhere && fresh {
             self.active = false;
             self.active_since = None;
