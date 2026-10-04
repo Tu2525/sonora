@@ -396,31 +396,36 @@ impl Devices {
             }
             return;
         };
-        if !self.changed(&now) {
+        let Some(reason) = self.changed(&now) else {
             return;
-        }
+        };
+        log::debug!(
+            "connect: reporting {} at {:?} because of the {reason}",
+            now.track,
+            now.position
+        );
         self.stamp = Instant::now();
         self.sent = Some(now.clone());
         link.publish(Some(now));
         cx.notify();
     }
 
-    /// Whether `now` says more than the last report did. The position moving on its own is not
-    /// news, a jump is.
-    fn changed(&self, now: &NowPlaying) -> bool {
+    /// What `now` says beyond the last report, or `None` when it says nothing new. The position
+    /// moving on its own is not news, a jump is.
+    fn changed(&self, now: &NowPlaying) -> Option<&'static str> {
         let Some(sent) = &self.sent else {
-            return true;
+            return Some("first report");
         };
         let expected = match sent.playing {
             true => sent.position + self.stamp.elapsed(),
             false => sent.position,
         };
         if now.position.abs_diff(expected) > SEEK_SLACK {
-            return true;
+            return Some("position");
         }
         let mut same = now.clone();
         same.position = sent.position;
-        same != *sent
+        (same != *sent).then(|| differs(&same, sent))
     }
 
     fn now_playing(&mut self, cx: &App) -> Option<NowPlaying> {
@@ -461,6 +466,20 @@ impl Devices {
                 Repeat::One => RepeatMode::Track,
             },
         })
+    }
+}
+
+/// Names the first thing two reports disagree on.
+fn differs(a: &NowPlaying, b: &NowPlaying) -> &'static str {
+    match () {
+        () if a.track != b.track => "track",
+        () if a.upcoming != b.upcoming => "queue",
+        () if a.context != b.context => "context",
+        () if a.playing != b.playing => "play state",
+        () if a.duration != b.duration => "duration",
+        () if a.volume != b.volume => "volume",
+        () if a.shuffle != b.shuffle => "shuffle",
+        _ => "repeat",
     }
 }
 

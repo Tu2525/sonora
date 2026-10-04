@@ -14,6 +14,7 @@ use futures::StreamExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_core::dealer::manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply};
 use librespot_core::dealer::protocol::{Command as Wire, Message, PlayCommand};
+use librespot_core::error::ErrorKind;
 use librespot_core::version::{SEMVER, SPOTIFY_SPIRC_VERSION};
 use librespot_core::{Error, Session};
 use librespot_protocol::connect::{
@@ -50,6 +51,13 @@ const CLAIM_GRACE: Duration = Duration::from_secs(3);
 const CARRIED: usize = 40;
 /// How long a new name settles before it is put, so a name typed in is put once.
 const RENAME_DELAY: Duration = Duration::from_millis(800);
+/// The least time between two puts of the state. A change that comes sooner waits for the next
+/// slot and is put with everything that changed meanwhile.
+const PUT_GAP: Duration = Duration::from_secs(1);
+/// How long puts wait after Spotify refuses one for coming too often, and the most they wait
+/// after being refused again and again.
+const BACKOFF_FIRST: Duration = Duration::from_secs(2);
+const BACKOFF_LAST: Duration = Duration::from_secs(60);
 const VOLUME_STEPS: u32 = 64;
 
 enum Input {
@@ -173,6 +181,12 @@ struct Worker {
     last_command: (u32, String),
     ack_at: Option<Instant>,
     rename_at: Option<Instant>,
+    /// The reason of a put that is due but held back, and when it may go out.
+    pending: Option<PutStateReason>,
+    flush_at: Option<Instant>,
+    last_put: Option<Instant>,
+    blocked_until: Option<Instant>,
+    backoff: Duration,
 }
 
 impl Worker {
@@ -193,6 +207,11 @@ impl Worker {
             last_command: (0, String::new()),
             ack_at: None,
             rename_at: None,
+            pending: None,
+            flush_at: None,
+            last_put: None,
+            blocked_until: None,
+            backoff: Duration::ZERO,
         }
     }
 
@@ -228,10 +247,11 @@ impl Worker {
                         self.announce().await;
                     }
                 }
+                () = acknowledge(self.flush_at) => self.flush().await,
                 () = acknowledge(self.ack_at) => {
                     self.ack_at = None;
                     if self.now.is_some() {
-                        self.put(PutStateReason::PLAYER_STATE_CHANGED).await;
+                        self.want_put(PutStateReason::PLAYER_STATE_CHANGED).await;
                     }
                 }
             }
@@ -362,19 +382,70 @@ impl Worker {
             true => PutStateReason::VOLUME_CHANGED,
             false => PutStateReason::PLAYER_STATE_CHANGED,
         };
-        self.put(reason).await;
+        self.want_put(reason).await;
+    }
+
+    /// Asks for the state to be put. Puts are spaced out, and held back for longer each time
+    /// Spotify refuses one for coming too often. Whatever the wait, the put that goes out
+    /// carries the state as it is then, so the changes in between cost nothing.
+    async fn want_put(&mut self, reason: PutStateReason) {
+        self.pending = Some(match self.pending {
+            Some(held) if rank(held) > rank(reason) => held,
+            _ => reason,
+        });
+
+        let now = Instant::now();
+        let due = [self.last_put.map(|at| at + PUT_GAP), self.blocked_until]
+            .into_iter()
+            .flatten()
+            .max();
+        match due {
+            Some(due) if due > now => self.flush_at = Some(due),
+            _ => self.flush().await,
+        }
+    }
+
+    /// Puts the state that was asked for, if it still means anything.
+    async fn flush(&mut self) {
+        self.flush_at = None;
+        let Some(reason) = self.pending.take() else {
+            return;
+        };
+        if self.enabled && self.connected && self.now.is_some() {
+            self.put(reason).await;
+        }
     }
 
     /// Puts the device's state and returns the account's devices as Spotify answers it.
     async fn put(&mut self, reason: PutStateReason) -> Option<Cluster> {
         let request = self.request_for(reason);
+        self.last_put = Some(Instant::now());
         let answer = self
             .session
             .spclient()
             .put_connect_state_request(&request)
             .await;
         match answer {
-            Ok(bytes) => Cluster::parse_from_bytes(&bytes).ok(),
+            Ok(bytes) => {
+                self.backoff = Duration::ZERO;
+                self.blocked_until = None;
+                Cluster::parse_from_bytes(&bytes).ok()
+            }
+            Err(error) if error.kind == ErrorKind::ResourceExhausted => {
+                self.backoff = (self.backoff * 2).clamp(BACKOFF_FIRST, BACKOFF_LAST);
+                let until = Instant::now() + self.backoff;
+                self.blocked_until = Some(until);
+                self.flush_at = Some(until);
+                self.pending = Some(match self.pending {
+                    Some(held) if rank(held) > rank(reason) => held,
+                    _ => reason,
+                });
+                log::warn!(
+                    "connect: Spotify asked for fewer state updates, waiting {}s",
+                    self.backoff.as_secs()
+                );
+                None
+            }
             Err(error) => {
                 log::warn!("connect: cannot put the state: {error}");
                 None
@@ -628,6 +699,15 @@ async fn control(session: Session, device: &str, command: Command) {
         .await;
     if let Err(error) = answer {
         log::warn!("connect: cannot control {device}: {error}");
+    }
+}
+
+/// How much a put matters when two are due at once: the stronger one goes out.
+fn rank(reason: PutStateReason) -> u8 {
+    match reason {
+        PutStateReason::NEW_DEVICE => 3,
+        PutStateReason::PLAYER_STATE_CHANGED => 2,
+        _ => 1,
     }
 }
 
