@@ -1365,18 +1365,6 @@ impl AppSettings {
         self.schedule_state_save(cx);
     }
 
-    /// Saves quietly. Nothing renders from the stored copy, the live queue is the source of truth.
-    pub fn set_resume_origin(&mut self, origin: Option<crate::Origin>, cx: &mut Context<Self>) {
-        let Some(resume) = self.state.resume.as_mut() else {
-            return;
-        };
-        if resume.origin == origin {
-            return;
-        }
-        resume.origin = origin;
-        self.save_state_quietly(cx);
-    }
-
     /// Saves quietly, since playback calls this on every position tick.
     pub fn set_resume_position(&mut self, position: f32, cx: &mut Context<Self>) {
         let Some(resume) = self.state.resume.as_mut() else {
@@ -2373,16 +2361,14 @@ fn take(pinned: &mut Vec<Held>, slug: &str, pin: &Pin) -> bool {
     true
 }
 
-/// Carries position and origin over from the previous record. Position survives only while the
-/// same track is current, origin as long as the provider is the same. Another provider inherits
-/// nothing.
+/// Carries the position over from the previous record while the same track is current on the
+/// same provider.
 fn carry(previous: Option<&Resume>, next: &mut Resume) {
     let playing = |resume: &Resume| resume.current.as_ref().map(|stub| stub.id.clone());
     let same = previous.filter(|old| old.provider == next.provider);
     next.position = same
         .filter(|old| playing(old) == playing(next))
         .map_or(0., |old| old.position);
-    next.origin = same.and_then(|old| old.origin.clone());
 }
 
 /// Inserts or moves `pin` into the `gap`th slot among the pins of `slugs`. `None` or a gap past
