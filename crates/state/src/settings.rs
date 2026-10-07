@@ -463,7 +463,7 @@ impl Default for Values {
             equalizer: false,
             equalizer_bands: vec![0.; equalizer::BANDS],
             sleep_timer: false,
-            spotify_connect: true,
+            spotify_connect: false,
             spotify_connect_name: ConnectName::Both,
             spotify_connect_custom_name: String::new(),
             discord_presence: false,
