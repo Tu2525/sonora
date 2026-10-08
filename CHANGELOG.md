@@ -14,6 +14,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   volume and start music in Sonora.
 - A devices button in the player bar moves playback between Sonora and your other Spotify
   devices and controls the one that is playing.
+### Fixed
+
+- YouTube Music and Apple Music artist pages now list the artist's whole discography instead
+  of stopping at ten albums and ten singles, and Deezer artist pages no longer stop at 50.
+- Albums on YouTube Music and Deezer artist pages now name the artist, and a card with no
+  artist to show no longer ends its line in a stray dot.
+- Artist names on Apple Music album cards now open the artist, in search, charts, home, the
+  library and on artist pages.
+- Top songs on Apple Music charts now show and play as songs instead of album cards.
+- The Appears on row of an artist page no longer sits flush against the Show all button.
+- Seeking in the last few seconds of a song now moves within that song, instead of jumping into
+  the next one or doing nothing.
 
 ## [0.42.2] - 2026-10-07
 
