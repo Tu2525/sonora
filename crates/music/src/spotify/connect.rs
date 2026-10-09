@@ -13,18 +13,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_core::dealer::manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply};
-use librespot_core::dealer::protocol::{Command as Wire, Message, PlayCommand};
+use librespot_core::dealer::protocol::{Command as Wire, Message, PlayCommand, TransferOptions};
 use librespot_core::error::ErrorKind;
+use librespot_core::spclient::TransferRequest;
 use librespot_core::version::{SEMVER, SPOTIFY_SPIRC_VERSION};
-use librespot_core::{Error, Session};
+use librespot_core::{Error, Session, SpotifyId};
 use librespot_protocol::connect::{
     Capabilities, Cluster, ClusterUpdate, Device as WireDevice, DeviceInfo, MemberType,
     PutStateReason, PutStateRequest, SetVolumeCommand,
 };
+use librespot_protocol::context_track::ContextTrack;
 use librespot_protocol::devices::DeviceType;
 use librespot_protocol::media::AudioQuality;
 use librespot_protocol::player::{
-    ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
+    ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
 };
 use librespot_protocol::transfer_state::TransferState;
 use protobuf::{EnumOrUnknown, Message as _, MessageField};
@@ -274,21 +276,45 @@ impl Worker {
                 self.rename_at = Some(Instant::now() + RENAME_DELAY);
             }
             Input::Publish(now) => self.publish(now).await,
-            Input::Transfer(to) => {
-                // playback moves from the device that has it, which this app knows when it is
-                // that device itself or when the last cluster named one
-                let from = match (self.active, self.active_device.is_empty()) {
-                    (true, _) => self.session.device_id().to_owned(),
-                    (false, false) => self.active_device.clone(),
-                    (false, true) => to.clone(),
-                };
-                if let Err(error) = self.session.spclient().transfer(&from, &to, None).await {
-                    log::warn!("connect: cannot move playback from {from} to {to}: {error}");
-                }
-            }
+            Input::Transfer(to) => self.transfer(to).await,
             Input::Control(device, command) => {
                 control(self.session.clone(), &device, command).await
             }
+        }
+    }
+
+    /// Moves playback to `to`. This app takes it the way librespot does, by naming itself on both
+    /// ends, and hands it on from itself, or from whichever device the last cluster named.
+    async fn transfer(&mut self, to: String) {
+        let mine = self.session.device_id().to_owned();
+        let from = match (to == mine, self.active, self.active_device.is_empty()) {
+            // playback is here already
+            (true, true, _) => return,
+            (true, false, _) | (false, true, _) => mine.clone(),
+            (false, false, false) => self.active_device.clone(),
+            (false, false, true) => to.clone(),
+        };
+        // without this the device that takes over may start paused
+        let request = TransferRequest {
+            transfer_options: TransferOptions {
+                restore_paused: Some("restore".to_owned()),
+                ..Default::default()
+            },
+        };
+        let answer = self
+            .session
+            .spclient()
+            .transfer(&from, &to, Some(&request))
+            .await;
+        match answer {
+            Ok(_) => {
+                log::info!("connect: moved playback from {from} to {to}");
+                // the cluster naming the new device is no longer older than the claim
+                if from == mine && to != mine {
+                    self.claimed_at = None;
+                }
+            }
+            Err(error) => log::warn!("connect: cannot move playback from {from} to {to}: {error}"),
         }
     }
 
@@ -501,11 +527,25 @@ impl Worker {
             return state;
         };
 
-        let uri = self.context_uri(now.context.as_ref());
+        // a device taking over loads the context by its uri, so a track with no album or playlist
+        // behind it names itself, and what follows it in Sonora goes over as a queue
+        let uri = match &now.context {
+            Some(context) => self.context_uri(context),
+            None => format!("{TRACK_PREFIX}{}", now.track),
+        };
+        let upcoming = match now.context {
+            Some(_) => "context",
+            None => "queue",
+        };
+        state.track = MessageField::some(provided(&now.track, "current", "context", &uri));
+        state.next_tracks = now
+            .upcoming
+            .iter()
+            .enumerate()
+            .map(|(at, id)| provided(id, &at.to_string(), upcoming, &uri))
+            .collect();
         state.context_url = format!("context://{uri}");
         state.context_uri = uri;
-        state.track = MessageField::some(provided(&now.track, 0));
-        state.index = MessageField::some(ContextIndex::new());
         state.timestamp = stamp as i64;
         state.position_as_of_timestamp = now.position.as_millis() as i64;
         state.duration = now.duration.as_millis() as i64;
@@ -515,12 +555,6 @@ impl Worker {
             repeating_track: now.repeat == RepeatMode::Track,
             ..Default::default()
         });
-        state.next_tracks = now
-            .upcoming
-            .iter()
-            .enumerate()
-            .map(|(at, id)| provided(id, at + 1))
-            .collect();
         let mut hasher = DefaultHasher::new();
         state
             .next_tracks
@@ -545,14 +579,11 @@ impl Worker {
         state
     }
 
-    fn context_uri(&self, context: Option<&Collection>) -> String {
+    fn context_uri(&self, context: &Collection) -> String {
         match context {
-            Some(Collection::Album(id)) => format!("spotify:album:{id}"),
-            Some(Collection::Playlist(id)) => format!("spotify:playlist:{id}"),
-            Some(Collection::Saved) => {
-                format!("spotify:user:{}:collection", self.session.username())
-            }
-            None => UNKNOWN_CONTEXT.to_owned(),
+            Collection::Album(id) => format!("spotify:album:{id}"),
+            Collection::Playlist(id) => format!("spotify:playlist:{id}"),
+            Collection::Saved => format!("spotify:user:{}:collection", self.session.username()),
         }
     }
 
@@ -813,12 +844,18 @@ fn kind(info: &DeviceInfo) -> DeviceKind {
     }
 }
 
-/// A track as the player state lists it. Spotify's apps look the track up by its uri.
-fn provided(id: &str, at: usize) -> ProvidedTrack {
+/// A track as the player state lists it, from `provider` (the context or the queue), labelled
+/// with the context it plays in as librespot labels its own. Spotify's apps look the track up by
+/// its uri.
+fn provided(id: &str, uid: &str, provider: &str, context: &str) -> ProvidedTrack {
     ProvidedTrack {
         uri: format!("{TRACK_PREFIX}{id}"),
-        uid: format!("sonora{at}"),
-        provider: "context".to_owned(),
+        uid: format!("sonora-{uid}"),
+        provider: provider.to_owned(),
+        metadata: [("context_uri", context), ("entity_uri", context)]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
         ..Default::default()
     }
 }
@@ -827,6 +864,16 @@ fn track_id(uri: &str) -> Option<String> {
     uri.strip_prefix(TRACK_PREFIX)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
+}
+
+/// The id of a track another device lists, read from its uri or, since Spotify's apps often send
+/// only that, from its raw id.
+fn listed_id(track: &ContextTrack) -> Option<String> {
+    if let Some(id) = track.uri.as_deref().and_then(track_id) {
+        return Some(id);
+    }
+    let gid = track.gid.as_deref().filter(|gid| !gid.is_empty())?;
+    SpotifyId::from_raw(gid).ok()?.to_base62().ok()
 }
 
 /// The album, playlist or saved tracks a context uri names. Anything else, such as an artist or
@@ -858,9 +905,7 @@ fn started_by_transfer(state: TransferState) -> Start {
         true => state.queue.tracks.first(),
         false => playback.current_track.as_ref(),
     };
-    let track = current
-        .and_then(|track| track.uri.as_deref())
-        .and_then(track_id);
+    let track = current.and_then(listed_id);
 
     let context = &state.current_session.context;
     let queued = state
@@ -868,12 +913,12 @@ fn started_by_transfer(state: TransferState) -> Start {
         .tracks
         .iter()
         .skip(from_queue as usize)
-        .filter_map(|track| track.uri.as_deref().and_then(track_id));
+        .filter_map(listed_id);
     let following = context
         .pages
         .iter()
         .flat_map(|page| page.tracks.iter())
-        .filter_map(|track| track.uri.as_deref().and_then(track_id))
+        .filter_map(listed_id)
         .skip_while(|id| Some(id) != track.as_ref())
         .skip(1);
 
@@ -893,7 +938,7 @@ fn started_by_play(play: &PlayCommand) -> Start {
         .pages
         .iter()
         .flat_map(|page| page.tracks.iter())
-        .filter_map(|track| track.uri.as_deref().and_then(track_id))
+        .filter_map(listed_id)
         .collect::<Vec<_>>();
 
     let skip = play.options.skip_to.as_ref();
