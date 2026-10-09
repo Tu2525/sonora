@@ -446,10 +446,13 @@ impl Devices {
                 this.starting = None;
                 match loaded {
                     Ok(loaded) => this.here(cx, |playback, cx| {
-                        playback.start(loaded.tracks, loaded.index, loaded.origin, cx);
-                        if !loaded.position.is_zero() {
-                            playback.seek(loaded.position, cx);
-                        }
+                        playback.start_at(
+                            loaded.tracks,
+                            loaded.index,
+                            loaded.origin,
+                            loaded.position,
+                            cx,
+                        );
                         if loaded.paused {
                             playback.pause(cx);
                         }

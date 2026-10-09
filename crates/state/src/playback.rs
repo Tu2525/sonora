@@ -768,6 +768,27 @@ impl Playback {
         self.begin(tracks, index, origin, cx);
     }
 
+    /// Replaces the queue with `tracks` and plays the one at `index` here from `at`, as another
+    /// device handed it over. A seek after `start` would be lost while the track loads.
+    pub(crate) fn start_at(
+        &mut self,
+        tracks: Vec<Track>,
+        index: usize,
+        origin: Option<Origin>,
+        at: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.fetch = None;
+        let Some(track) = self
+            .queue
+            .update(cx, |queue, cx| queue.start(tracks, index, origin, cx))
+        else {
+            return;
+        };
+        self.leave_station();
+        self.load_from(&track, at, Start::Pick, cx);
+    }
+
     /// Replaces the queue with `tracks` and plays the first playable one, or a random one when
     /// shuffle is on.
     pub fn start_any(
