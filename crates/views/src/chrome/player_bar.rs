@@ -19,7 +19,7 @@ use ui::{
 use crate::chrome::SidebarRight;
 use crate::chrome::devices::DevicePicker;
 use crate::shared::menus::ItemMenu;
-use crate::shared::transport::{NOTCH, like, moved, percent, steered, transport, volume_icon};
+use crate::shared::transport::{NOTCH, fraction, like, moved, percent, transport, volume_icon};
 
 const SEEK_MAX: f32 = 560.;
 const VOLUME_WIDTH: f32 = 110.;
@@ -248,10 +248,7 @@ impl PlayerBar {
         let muted = theme.muted_foreground;
         let artwork = ui::snapped(theme.metrics.row, window);
         let artists = theme.text(ui::Text::Small);
-        let track = match steered(cx) {
-            Some(steered) => steered.track,
-            None => self.playback.read(cx).track().cloned(),
-        };
+        let track = self.playback.read(cx).shown_track(cx);
         let cover = track.as_ref().and_then(|track| track.cover.clone());
         let explicit = track.as_ref().is_some_and(|track| track.explicit);
         let like = like(track.clone(), cx);
@@ -379,24 +376,9 @@ impl Render for PlayerBar {
         };
 
         let playback = self.playback.read(cx);
-        let (seekable, elapsed, total, progress) = match steered(cx) {
-            Some(steered) => (
-                !steered.duration.is_zero(),
-                steered.position,
-                steered.duration,
-                steered.position.as_secs_f32() / steered.duration.as_secs_f32().max(1.),
-            ),
-            None => (
-                playback.track().is_some(),
-                playback.position(),
-                playback
-                    .track()
-                    .map(|track| track.duration)
-                    .unwrap_or(Duration::ZERO),
-                playback.progress(),
-            ),
-        };
-        let progress = self.pending.unwrap_or(progress);
+        let seekable = playback.shown_track(cx).is_some();
+        let (elapsed, total) = playback.shown_time(cx);
+        let progress = self.pending.unwrap_or_else(|| fraction(elapsed, total));
         let clock_width = clock_text
             * match total.as_secs() >= 3600 {
                 true => CLOCK_LONG,

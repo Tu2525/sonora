@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use gpui::prelude::*;
 use gpui::{App, Entity, SharedString, div};
 use i18n::t;
@@ -12,6 +14,14 @@ const STEP: f32 = 0.004;
 /// The other device playback is on, which the player shows instead of this app's own.
 pub(crate) fn steered(cx: &App) -> Option<Steered> {
     Sonora::global(cx).devices.read(cx).steered()
+}
+
+/// How far through `total` `elapsed` is, from 0 to 1.
+pub(crate) fn fraction(elapsed: Duration, total: Duration) -> f32 {
+    match total.is_zero() {
+        true => 0.,
+        false => (elapsed.as_secs_f32() / total.as_secs_f32()).clamp(0., 1.),
+    }
 }
 
 pub(crate) fn volume_icon(level: f32) -> &'static str {
@@ -72,7 +82,7 @@ pub(crate) fn transport(
         .flex()
         .items_center()
         .gap_2()
-        .child(shuffle(queue, frosted, cx))
+        .child(shuffle(playback, frosted, cx))
         .child(previous(playback, frosted, cx))
         .child(toggle(playback, big, frosted, cx))
         .child(next(playback, queue, frosted, cx))
@@ -105,10 +115,10 @@ pub(crate) fn toggle(playback: &Entity<Playback>, big: bool, frosted: bool, cx: 
         })
 }
 
-fn shuffle(queue: &Entity<Queue>, frosted: bool, cx: &App) -> Button {
+fn shuffle(playback: &Entity<Playback>, frosted: bool, cx: &App) -> Button {
     let theme = *cx.theme();
-    let on = queue.read(cx).shuffle();
-    let queue = queue.clone();
+    let on = playback.read(cx).shown_shuffle(cx);
+    let playback = playback.clone();
 
     Button::new("shuffle")
         .ghost()
@@ -121,13 +131,13 @@ fn shuffle(queue: &Entity<Queue>, frosted: bool, cx: &App) -> Button {
             false => theme.muted_foreground,
         })
         .on_click(move |_, _, cx| {
-            queue.update(cx, |queue, cx| queue.toggle_shuffle(cx));
+            playback.update(cx, |playback, cx| playback.toggle_shuffle(cx));
         })
 }
 
 fn repeat(playback: &Entity<Playback>, frosted: bool, cx: &App) -> Button {
     let theme = *cx.theme();
-    let repeat = playback.read(cx).repeat();
+    let repeat = playback.read(cx).shown_repeat(cx);
     let playback = playback.clone();
 
     Button::new("repeat")
