@@ -2,7 +2,7 @@
 //! the service's other apps ask of it, and the account's other devices. Nothing here names a
 //! provider, so `state` and `views` stay on the trait while one module implements it.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -44,6 +44,8 @@ pub struct NowPlaying {
     pub track: String,
     pub upcoming: Vec<String>,
     pub context: Option<Collection>,
+    /// Where `track` sits in `context`, counted from 0, when that is known.
+    pub index: Option<usize>,
     pub playing: bool,
     pub position: Duration,
     pub duration: Duration,
@@ -115,6 +117,24 @@ pub struct Elsewhere {
     pub device: Device,
     pub track: Option<String>,
     pub playing: bool,
+    /// How far into the track the device was at `stamp`. It has moved on since if `playing`.
+    pub position: Duration,
+    pub stamp: SystemTime,
+    pub duration: Duration,
+}
+
+impl Elsewhere {
+    /// How far into the track the device is now, never past its end.
+    pub fn live_position(&self) -> Duration {
+        let moved = match self.playing {
+            true => self.stamp.elapsed().unwrap_or_default(),
+            false => Duration::ZERO,
+        };
+        match self.duration.is_zero() {
+            true => self.position + moved,
+            false => (self.position + moved).min(self.duration),
+        }
+    }
 }
 
 /// The account's devices other than this app, and the one of them that has playback, if any.

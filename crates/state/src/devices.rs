@@ -32,6 +32,19 @@ struct Loaded {
     paused: bool,
 }
 
+/// Another device of the account that has playback, as the player shows it while this app steers
+/// that device instead of playing itself.
+#[derive(Clone, Debug)]
+pub struct Steered {
+    pub device: Device,
+    /// The track it plays, once it is read in.
+    pub track: Option<Track>,
+    pub playing: bool,
+    /// How far into the track it is now.
+    pub position: Duration,
+    pub duration: Duration,
+}
+
 /// The provider's device network as the app sees it: this app listed as a device, playback
 /// reported to the account's other apps, their commands carried out, and the account's other
 /// devices to hand playback to. Only a provider that has such a network gives it anything to do.
@@ -132,6 +145,29 @@ impl Devices {
     /// The track playing on that device, once it is read in.
     pub fn remote_track(&self) -> Option<&Track> {
         self.remote.as_ref()
+    }
+
+    /// The other device playback is on, which the player shows and steers instead of this app's
+    /// own engine. `None` while playback is here or nowhere.
+    pub fn steered(&self) -> Option<Steered> {
+        if !self.available() {
+            return None;
+        }
+        let elsewhere = self.elsewhere()?;
+        let duration = match elsewhere.duration.is_zero() {
+            true => self
+                .remote
+                .as_ref()
+                .map_or(Duration::ZERO, |track| track.duration),
+            false => elsewhere.duration,
+        };
+        Some(Steered {
+            device: elsewhere.device.clone(),
+            track: self.remote.clone(),
+            playing: elsewhere.playing,
+            position: elsewhere.live_position(),
+            duration,
+        })
     }
 
     /// Moves playback onto this app from whichever device has it.
@@ -455,6 +491,7 @@ impl Devices {
             track: id,
             upcoming,
             context,
+            index: None,
             playing,
             position: playback.live_position(),
             duration: track.duration,

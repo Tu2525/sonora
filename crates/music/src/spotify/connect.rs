@@ -26,7 +26,7 @@ use librespot_protocol::context_track::ContextTrack;
 use librespot_protocol::devices::DeviceType;
 use librespot_protocol::media::AudioQuality;
 use librespot_protocol::player::{
-    ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
+    ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
 };
 use librespot_protocol::transfer_state::TransferState;
 use protobuf::{EnumOrUnknown, Message as _, MessageField};
@@ -176,6 +176,8 @@ struct Worker {
     started: bool,
     connected: bool,
     now: Option<NowPlaying>,
+    /// When `now` was reported, which its position is as of.
+    now_at: Instant,
     active: bool,
     active_since: Option<SystemTime>,
     claimed_at: Option<Instant>,
@@ -205,6 +207,7 @@ impl Worker {
             started: false,
             connected: false,
             now: None,
+            now_at: Instant::now(),
             active: false,
             active_since: None,
             claimed_at: None,
@@ -294,6 +297,13 @@ impl Worker {
             (false, false, false) => self.active_device.clone(),
             (false, false, true) => to.clone(),
         };
+        // the device taking over starts from the last state put, so put one as of now
+        let blocked = self
+            .blocked_until
+            .is_some_and(|until| until > Instant::now());
+        if from == mine && to != mine && self.now.is_some() && !blocked {
+            self.put(PutStateReason::PLAYER_STATE_CHANGED).await;
+        }
         // without this the device that takes over may start paused
         let request = TransferRequest {
             transfer_options: TransferOptions {
@@ -379,7 +389,21 @@ impl Worker {
 
     async fn publish(&mut self, now: Option<NowPlaying>) {
         let before = std::mem::replace(&mut self.now, now);
+        self.now_at = Instant::now();
         self.sync(before).await;
+    }
+
+    /// How far into its track `now` is at this moment. The app only reports the position when it
+    /// jumps, so in between it has moved on by the time since the report.
+    fn live_position(&self, now: &NowPlaying) -> Duration {
+        let position = match now.playing {
+            true => now.position + self.now_at.elapsed(),
+            false => now.position,
+        };
+        match now.duration.is_zero() {
+            true => position,
+            false => position.min(now.duration),
+        }
     }
 
     /// Puts the state the device is in now, given what it reported `before`.
@@ -546,8 +570,13 @@ impl Worker {
             .collect();
         state.context_url = format!("context://{uri}");
         state.context_uri = uri;
+        // a device taking over finds the track by where it sits as well as by its uri
+        state.index = MessageField::from_option(now.index.map(|track| ContextIndex {
+            track: track as u32,
+            ..Default::default()
+        }));
         state.timestamp = stamp as i64;
-        state.position_as_of_timestamp = now.position.as_millis() as i64;
+        state.position_as_of_timestamp = self.live_position(now).as_millis() as i64;
         state.duration = now.duration.as_millis() as i64;
         state.options = MessageField::some(ContextPlayerOptions {
             shuffling_context: now.shuffle,
@@ -580,11 +609,7 @@ impl Worker {
     }
 
     fn context_uri(&self, context: &Collection) -> String {
-        match context {
-            Collection::Album(id) => format!("spotify:album:{id}"),
-            Collection::Playlist(id) => format!("spotify:playlist:{id}"),
-            Collection::Saved => format!("spotify:user:{}:collection", self.session.username()),
-        }
+        collection_uri(context, &self.session.username())
     }
 
     fn cluster(&mut self, update: ClusterUpdate) {
@@ -628,10 +653,14 @@ impl Worker {
             .filter(|_| cluster.active_device_id != mine)
             .map(|info| {
                 let state = &cluster.player_state;
+                let millis = |value: i64| Duration::from_millis(value.max(0) as u64);
                 Elsewhere {
                     device: known(&cluster.active_device_id, info),
                     track: track_id(&state.track.uri),
                     playing: state.is_playing && !state.is_paused,
+                    position: millis(state.position_as_of_timestamp),
+                    stamp: UNIX_EPOCH + millis(state.timestamp),
+                    duration: millis(state.duration),
                 }
             });
         Roster { devices, elsewhere }
@@ -719,6 +748,16 @@ async fn control(session: Session, device: &str, command: Command) {
             format!("/connect-state/v1/connect/volume/from/{mine}/to/{device}"),
             serde_json::json!({ "volume": volume_word(level) }),
         ),
+        Command::Start(start) => {
+            let Some(command) = play_command(&start, &session.username()) else {
+                return;
+            };
+            (
+                Method::POST,
+                format!("/connect-state/v1/player/command/from/{mine}/to/{device}"),
+                serde_json::json!({ "command": command }),
+            )
+        }
         command => {
             let Some(command) = wire_command(&command) else {
                 return;
@@ -823,6 +862,39 @@ fn wire_command(command: &Command) -> Option<serde_json::Value> {
         }
         _ => return None,
     })
+}
+
+/// A play command asking another device to start `start`: its collection from the track, or the
+/// track on its own. `None` when it names neither.
+fn play_command(start: &Start, username: &str) -> Option<serde_json::Value> {
+    let track = start
+        .track
+        .as_deref()
+        .map(|id| format!("{TRACK_PREFIX}{id}"));
+    let context = match &start.collection {
+        Some(collection) => collection_uri(collection, username),
+        None => track.clone()?,
+    };
+    Some(serde_json::json!({
+        "endpoint": "play",
+        "context": { "uri": context, "url": format!("context://{context}"), "metadata": {} },
+        "play_origin": { "feature_identifier": "sonora", "feature_version": SEMVER },
+        "options": {
+            "skip_to": track.map(|uri| serde_json::json!({ "track_uri": uri })),
+            "seek_to": start.position.as_millis() as u64,
+            "initially_paused": start.paused,
+        },
+        "logging_params": {},
+    }))
+}
+
+/// The uri Spotify knows a collection by.
+fn collection_uri(collection: &Collection, username: &str) -> String {
+    match collection {
+        Collection::Album(id) => format!("spotify:album:{id}"),
+        Collection::Playlist(id) => format!("spotify:playlist:{id}"),
+        Collection::Saved => format!("spotify:user:{username}:collection"),
+    }
 }
 
 fn kind(info: &DeviceInfo) -> DeviceKind {

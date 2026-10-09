@@ -37,7 +37,7 @@ mod window_shape;
 pub use artist::{ArtistDetail, ArtistDetailEvent};
 pub use cover::Cover;
 pub use detail::{Collection, Detail, Header};
-pub use devices::Devices;
+pub use devices::{Devices, Steered};
 pub use drm::{CdmState, Drm};
 pub use genre::{GenreDetails, Genres};
 pub use history::{History, HistoryState};
