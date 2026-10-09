@@ -13,7 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt as _;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_core::dealer::manager::{BoxedStream, BoxedStreamResult, Reply, RequestReply};
-use librespot_core::dealer::protocol::{Command as Wire, Message, PlayCommand, TransferOptions};
+use librespot_core::dealer::protocol::{
+    Command as Wire, Message, PayloadValue, PlayCommand, TransferOptions,
+};
 use librespot_core::error::ErrorKind;
 use librespot_core::spclient::TransferRequest;
 use librespot_core::version::{SEMVER, SPOTIFY_SPIRC_VERSION};
@@ -29,7 +31,8 @@ use librespot_protocol::player::{
     ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack, Suppressions,
 };
 use librespot_protocol::transfer_state::TransferState;
-use protobuf::{EnumOrUnknown, Message as _, MessageField};
+use protobuf::rt::WireType;
+use protobuf::{CodedInputStream, EnumOrUnknown, Message as _, MessageField};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 
@@ -61,6 +64,12 @@ const PUT_GAP: Duration = Duration::from_secs(1);
 const BACKOFF_FIRST: Duration = Duration::from_secs(2);
 const BACKOFF_LAST: Duration = Duration::from_secs(60);
 const VOLUME_STEPS: u32 = 64;
+/// The protobuf tags of a collection update: its items, and in each its kind, raw id and whether
+/// it was removed.
+const ITEM: u32 = 1 << 3 | 2;
+const ITEM_KIND: u32 = 1 << 3;
+const ITEM_ID: u32 = 2 << 3 | 2;
+const ITEM_REMOVED: u32 = 6 << 3;
 
 enum Input {
     Enable(bool),
@@ -127,12 +136,13 @@ impl Connect for Connection {
 }
 
 /// What the dealer hands the worker: the connection id Spotify gave this session, changes to the
-/// account's devices, volume requests, and playback commands.
+/// account's devices, volume requests, playback commands, and likes made in other apps.
 struct Streams {
     connection_ids: BoxedStreamResult<String>,
     clusters: BoxedStreamResult<ClusterUpdate>,
     volumes: BoxedStreamResult<SetVolumeCommand>,
     commands: BoxedStream<RequestReply>,
+    likes: BoxedStreamResult<Vec<(String, bool)>>,
 }
 
 impl Streams {
@@ -143,6 +153,7 @@ impl Streams {
             clusters: Box::pin(futures::stream::pending()),
             volumes: Box::pin(futures::stream::pending()),
             commands: Box::pin(futures::stream::pending()),
+            likes: Box::pin(futures::stream::pending()),
         }
     }
 
@@ -162,6 +173,13 @@ impl Streams {
             volumes: dealer
                 .listen_for("hm://connect-state/v1/connect/volume", Message::from_raw)?,
             commands: dealer.handle_for("hm://connect-state/v1/player/command")?,
+            likes: dealer.listen_for("hm://collection/collection/", |message| {
+                match message.payload {
+                    PayloadValue::Raw(bytes) => Ok(likes(&bytes)?),
+                    // the same update comes again as JSON, which carries nothing more
+                    _ => Ok(Vec::new()),
+                }
+            })?,
         })
     }
 }
@@ -234,6 +252,15 @@ impl Worker {
                     Some(Ok(id)) => self.connection_id(id).await,
                     Some(Err(error)) => log::warn!("connect: bad connection id message: {error}"),
                     None => self.streams.connection_ids = Box::pin(futures::stream::pending()),
+                },
+                likes = self.streams.likes.next() => match likes {
+                    Some(Ok(likes)) => {
+                        for (track, liked) in likes {
+                            self.out.send(Event::Liked { track, liked }).ok();
+                        }
+                    }
+                    Some(Err(error)) => log::warn!("connect: bad collection update: {error}"),
+                    None => self.streams.likes = Box::pin(futures::stream::pending()),
                 },
                 update = self.streams.clusters.next() => match update {
                     Some(Ok(update)) => self.cluster(update),
@@ -1051,4 +1078,43 @@ fn millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// The tracks a collection update likes or unlikes, as their ids and whether they are liked now.
+/// librespot has no message for the update, so its few fields are read by their tags: a list of
+/// items, each with its kind (0 for a track), raw id and whether it was removed.
+fn likes(bytes: &[u8]) -> protobuf::Result<Vec<(String, bool)>> {
+    let mut input = CodedInputStream::from_bytes(bytes);
+    let mut likes = Vec::new();
+    while let Some(tag) = input.read_raw_tag_or_eof()? {
+        match tag {
+            ITEM => likes.extend(like(&input.read_bytes()?)?),
+            tag => match WireType::new(tag & 7) {
+                Some(wire) => input.skip_field(wire)?,
+                None => break,
+            },
+        }
+    }
+    Ok(likes)
+}
+
+fn like(bytes: &[u8]) -> protobuf::Result<Option<(String, bool)>> {
+    let mut input = CodedInputStream::from_bytes(bytes);
+    let (mut kind, mut gid, mut removed) = (0, Vec::new(), false);
+    while let Some(tag) = input.read_raw_tag_or_eof()? {
+        match tag {
+            ITEM_KIND => kind = input.read_uint64()?,
+            ITEM_ID => gid = input.read_bytes()?,
+            ITEM_REMOVED => removed = input.read_bool()?,
+            tag => match WireType::new(tag & 7) {
+                Some(wire) => input.skip_field(wire)?,
+                None => break,
+            },
+        }
+    }
+    let track = (kind == 0)
+        .then(|| SpotifyId::from_raw(&gid).ok())
+        .flatten()
+        .map(|id| id.to_base62());
+    Ok(track.map(|track| (track, !removed)))
 }

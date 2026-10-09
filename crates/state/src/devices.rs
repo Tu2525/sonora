@@ -13,8 +13,8 @@ use music::{MusicApi, Track};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
-    AppSettings, ConnectName, Io, Origin, Playback, Queue, Repeat, Session, SessionEvent, Whence,
-    join,
+    AppSettings, ConnectName, Io, Library, Origin, Playback, Queue, Repeat, Session, SessionEvent,
+    Whence, join,
 };
 
 /// How far the position may stray from where steady playback would have put it before it is
@@ -53,6 +53,7 @@ pub struct Steered {
 pub struct Devices {
     playback: Entity<Playback>,
     queue: Entity<Queue>,
+    library: Entity<Library>,
     settings: Entity<AppSettings>,
     session: Entity<Session>,
     io: Io,
@@ -73,6 +74,7 @@ pub struct Devices {
     starting: Option<Task<()>>,
     fetching: Option<Task<()>>,
     queuing: HashMap<String, Task<()>>,
+    liking: HashMap<String, Task<()>>,
     /// Notifies twice a second while another device plays, so its progress is redrawn.
     ticking: Option<Task<()>>,
 }
@@ -81,6 +83,7 @@ impl Devices {
     pub fn new(
         playback: Entity<Playback>,
         queue: Entity<Queue>,
+        library: Entity<Library>,
         settings: Entity<AppSettings>,
         session: Entity<Session>,
         io: Io,
@@ -103,6 +106,7 @@ impl Devices {
         let mut devices = Self {
             playback,
             queue,
+            library,
             settings,
             session,
             io,
@@ -118,6 +122,7 @@ impl Devices {
             starting: None,
             fetching: None,
             queuing: HashMap::new(),
+            liking: HashMap::new(),
             ticking: None,
         };
         devices.relink(cx);
@@ -231,6 +236,7 @@ impl Devices {
         self.starting = None;
         self.fetching = None;
         self.queuing.clear();
+        self.liking.clear();
         self.roster = Roster::default();
         self.remote = None;
         self.claimed = false;
@@ -298,6 +304,7 @@ impl Devices {
         match event {
             Event::Roster(roster) => self.set_roster(roster, cx),
             Event::Command(command) => self.run(command, cx),
+            Event::Liked { track, liked } => self.liked(track, liked, cx),
         }
     }
 
@@ -431,6 +438,40 @@ impl Devices {
             .ok();
         });
         self.queuing.insert(slot, task);
+    }
+
+    /// Shows a like made in another of the account's apps, reading the track in first when it
+    /// was liked rather than unliked.
+    fn liked(&mut self, id: String, liked: bool, cx: &mut Context<Self>) {
+        // an unlike also calls off a like of the same track still being read in
+        self.liking.remove(&id);
+        if !liked {
+            return self
+                .library
+                .update(cx, |library, cx| library.liked_elsewhere(&id, None, cx));
+        }
+        let Some(client) = self.session.read(cx).client() else {
+            return;
+        };
+        let io = self.io.clone();
+        let slot = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let wanted = id.clone();
+            let found = join(io.spawn(async move { client.track(&wanted).await })).await;
+            this.update(cx, |this, cx| {
+                this.liking.remove(&id);
+                match found {
+                    Ok(track) => this.library.update(cx, |library, cx| {
+                        library.liked_elsewhere(&id, Some(track), cx)
+                    }),
+                    Err(error) => {
+                        log::warn!("connect: cannot read the liked track {id}: {error:#}")
+                    }
+                }
+            })
+            .ok();
+        });
+        self.liking.insert(slot, task);
     }
 
     /// Plays what another device handed over, from where it left off.

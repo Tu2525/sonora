@@ -147,6 +147,12 @@ pub struct Roster {
 pub enum Event {
     Command(Command),
     Roster(Roster),
+    /// One of the account's apps liked a track, or took the like back. `track` is a provider
+    /// track id.
+    Liked {
+        track: String,
+        liked: bool,
+    },
 }
 
 /// The connection to a provider's device network. Every call is fire-and-forget: what comes
