@@ -22,6 +22,8 @@ use crate::{
 const SEEK_SLACK: Duration = Duration::from_secs(2);
 /// How many upcoming tracks the other devices are told about.
 const UPCOMING: usize = 10;
+/// How often the views are told that another device's playback moved on while it plays.
+const TICK: Duration = Duration::from_millis(500);
 
 /// Where a start handed over by another device begins, with the tracks it plays read in.
 struct Loaded {
@@ -71,6 +73,8 @@ pub struct Devices {
     starting: Option<Task<()>>,
     fetching: Option<Task<()>>,
     queuing: HashMap<String, Task<()>>,
+    /// Notifies twice a second while another device plays, so its progress is redrawn.
+    ticking: Option<Task<()>>,
 }
 
 impl Devices {
@@ -94,6 +98,8 @@ impl Devices {
         cx.observe(&queue, |this, _, cx| this.publish(cx)).detach();
         cx.observe(&settings, |this, _, cx| this.apply(cx)).detach();
 
+        let this = cx.weak_entity();
+        playback.update(cx, |playback, _| playback.set_devices(this));
         let mut devices = Self {
             playback,
             queue,
@@ -112,6 +118,7 @@ impl Devices {
             starting: None,
             fetching: None,
             queuing: HashMap::new(),
+            ticking: None,
         };
         devices.relink(cx);
         devices
@@ -189,6 +196,17 @@ impl Devices {
         if let Some(link) = &self.link {
             link.control(device, command);
         }
+    }
+
+    /// Has playback act on this app's own engine, as another device asked, rather than steer
+    /// whichever device has playback.
+    fn here(
+        &self,
+        cx: &mut Context<Self>,
+        act: impl FnOnce(&mut Playback, &mut Context<Playback>),
+    ) {
+        self.playback
+            .update(cx, |playback, cx| playback.locally(cx, act));
     }
 
     /// Takes the device network of the signed-in provider, or lets go of the last one when
@@ -294,7 +312,37 @@ impl Devices {
                 self.fetching = Some(self.read_remote(client, id, cx));
             }
         }
+        self.tick(cx);
         cx.notify();
+    }
+
+    /// Whether another device has playback that plays, which is when its position moves on.
+    fn moving(&self) -> bool {
+        self.available() && self.elsewhere().is_some_and(|elsewhere| elsewhere.playing)
+    }
+
+    /// Starts the timer that redraws another device's progress while it plays, or drops it once
+    /// nothing plays there.
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        if !self.moving() {
+            self.ticking = None;
+        } else if self.ticking.is_none() {
+            self.ticking = Some(cx.spawn(async move |this, cx| {
+                while this.update(cx, |this, cx| this.pulse(cx)).unwrap_or(false) {
+                    cx.background_executor().timer(TICK).await;
+                }
+            }));
+        }
+    }
+
+    /// Tells the views that time has passed, and says whether the timer is to go on.
+    fn pulse(&mut self, cx: &mut Context<Self>) -> bool {
+        let moving = self.moving();
+        match moving {
+            true => cx.notify(),
+            false => self.ticking = None,
+        }
+        moving
     }
 
     fn read_remote(
@@ -328,20 +376,14 @@ impl Devices {
     /// Carries out what another device asked of this one.
     fn run(&mut self, command: Command, cx: &mut Context<Self>) {
         match command {
-            Command::Play => self.playback.update(cx, |playback, cx| playback.resume(cx)),
-            Command::Pause => self.playback.update(cx, |playback, cx| playback.pause(cx)),
-            Command::Next => self.playback.update(cx, |playback, cx| playback.next(cx)),
-            Command::Previous => self
-                .playback
-                .update(cx, |playback, cx| playback.previous(cx)),
-            Command::Seek(at) => self
-                .playback
-                .update(cx, |playback, cx| playback.seek(at, cx)),
-            Command::Volume(level) => self
-                .playback
-                .update(cx, |playback, cx| playback.set_volume(level, cx)),
+            Command::Play => self.here(cx, |playback, cx| playback.resume(cx)),
+            Command::Pause => self.here(cx, |playback, cx| playback.pause(cx)),
+            Command::Next => self.here(cx, |playback, cx| playback.next(cx)),
+            Command::Previous => self.here(cx, |playback, cx| playback.previous(cx)),
+            Command::Seek(at) => self.here(cx, |playback, cx| playback.seek(at, cx)),
+            Command::Volume(level) => self.here(cx, |playback, cx| playback.set_volume(level, cx)),
             Command::Shuffle(on) => self.queue.update(cx, |queue, cx| queue.set_shuffle(on, cx)),
-            Command::Repeat(mode) => self.playback.update(cx, |playback, cx| {
+            Command::Repeat(mode) => self.here(cx, |playback, cx| {
                 playback.set_repeat(
                     match mode {
                         RepeatMode::Off => Repeat::Off,
@@ -356,7 +398,7 @@ impl Devices {
             Command::Released => {
                 // another device took over, so this one stops without calling playback back
                 self.claimed = false;
-                self.playback.update(cx, |playback, cx| playback.pause(cx));
+                self.here(cx, |playback, cx| playback.pause(cx));
                 self.publish(cx);
             }
         }
@@ -374,9 +416,7 @@ impl Devices {
             this.update(cx, |this, cx| {
                 this.queuing.remove(&key);
                 match found {
-                    Ok(track) => this
-                        .playback
-                        .update(cx, |playback, cx| playback.enqueue(track, cx)),
+                    Ok(track) => this.here(cx, |playback, cx| playback.enqueue(track, cx)),
                     Err(error) => log::warn!("connect: cannot queue {key}: {error:#}"),
                 }
             })
@@ -397,7 +437,7 @@ impl Devices {
             this.update(cx, |this, cx| {
                 this.starting = None;
                 match loaded {
-                    Ok(loaded) => this.playback.update(cx, |playback, cx| {
+                    Ok(loaded) => this.here(cx, |playback, cx| {
                         playback.start(loaded.tracks, loaded.index, loaded.origin, cx);
                         if !loaded.position.is_zero() {
                             playback.seek(loaded.position, cx);
@@ -481,17 +521,12 @@ impl Devices {
             .filter(|id| !music::is_local_id(id))
             .take(UPCOMING)
             .collect();
-        let context = playback.origin(cx).and_then(|origin| match origin.whence {
-            Whence::Album => Some(Collection::Album(origin.id.clone())),
-            Whence::Playlist => Some(Collection::Playlist(origin.id.clone())),
-            Whence::Saved => Some(Collection::Saved),
-            _ => None,
-        });
+        let context = playback.origin(cx).and_then(collection_of);
         Some(NowPlaying {
             track: id,
             upcoming,
+            index: context.is_some().then(|| queue.place()).flatten(),
             context,
-            index: None,
             playing,
             position: playback.live_position(),
             duration: track.duration,
@@ -503,6 +538,17 @@ impl Devices {
                 Repeat::One => RepeatMode::Track,
             },
         })
+    }
+}
+
+/// The collection a track was queued from, as the device network names it. `None` for one it has
+/// no name for, such as an artist or a radio.
+pub(crate) fn collection_of(origin: &Origin) -> Option<Collection> {
+    match origin.whence {
+        Whence::Album => Some(Collection::Album(origin.id.clone())),
+        Whence::Playlist => Some(Collection::Playlist(origin.id.clone())),
+        Whence::Saved => Some(Collection::Saved),
+        _ => None,
     }
 }
 

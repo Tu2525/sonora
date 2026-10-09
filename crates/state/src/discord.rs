@@ -228,8 +228,10 @@ impl Discord {
         if !settings.discord_presence() || !playing && !settings.discord_show_paused() {
             return Shown::Off;
         }
-        // Spotify's own status already covers a track that Spotify is told about
-        if self.devices.read(cx).publishing() {
+        // Spotify's own status already covers a track that Spotify is told about, and one that
+        // plays on another of the account's devices
+        let devices = self.devices.read(cx);
+        if devices.publishing() || devices.steered().is_some() {
             return Shown::Off;
         }
 
