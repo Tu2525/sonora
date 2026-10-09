@@ -742,6 +742,7 @@ impl Worker {
 /// Sends a command to another device of the account through the session.
 async fn control(session: Session, device: &str, command: Command) {
     let mine = session.device_id();
+    let what = format!("{command:?}");
     let (method, endpoint, body) = match command {
         Command::Volume(level) => (
             Method::PUT,
@@ -778,7 +779,7 @@ async fn control(session: Session, device: &str, command: Command) {
         .request(&method, &endpoint, Some(headers), Some(body.as_bytes()))
         .await;
     if let Err(error) = answer {
-        log::warn!("connect: cannot control {device}: {error}");
+        log::warn!("connect: cannot send {what} to {device}: {error}");
     }
 }
 
