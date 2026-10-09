@@ -155,9 +155,10 @@ impl Devices {
     }
 
     /// The other device playback is on, which the player shows and steers instead of this app's
-    /// own engine. `None` while playback is here or nowhere.
+    /// own engine. `None` while playback is here or nowhere, including the moment between this app
+    /// taking playback and the network saying so.
     pub fn steered(&self) -> Option<Steered> {
-        if !self.available() {
+        if !self.available() || self.claimed {
             return None;
         }
         let elsewhere = self.elsewhere()?;
@@ -313,7 +314,14 @@ impl Devices {
             }
         }
         self.tick(cx);
+        self.redraw(cx);
+    }
+
+    /// Tells the views, and everything that follows playback such as the lyrics, that what the
+    /// other device plays has changed or moved on.
+    fn redraw(&self, cx: &mut Context<Self>) {
         cx.notify();
+        self.playback.update(cx, |_, cx| cx.notify());
     }
 
     /// Whether another device has playback that plays, which is when its position moves on.
@@ -339,7 +347,7 @@ impl Devices {
     fn pulse(&mut self, cx: &mut Context<Self>) -> bool {
         let moving = self.moving();
         match moving {
-            true => cx.notify(),
+            true => self.redraw(cx),
             false => self.ticking = None,
         }
         moving
@@ -362,7 +370,7 @@ impl Devices {
                         let current = this.elsewhere().and_then(|e| e.track.as_deref());
                         if current == Some(id.as_str()) {
                             this.remote = Some(track);
-                            cx.notify();
+                            this.redraw(cx);
                         }
                     }
                     Ok(_) => {}
