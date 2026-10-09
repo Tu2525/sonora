@@ -15,6 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A devices button in the player bar moves playback between Sonora and your other Spotify
   devices. While another device plays, the player bar and lyrics follow its song, and Sonora's
   controls and the songs you pick play there, the way Spotify's own apps do.
+- While Show as a Spotify device is on, a song you like or unlike in Spotify's other apps
+  updates its heart in Sonora right away, without a restart.
 
 ### Changed
 
