@@ -571,6 +571,11 @@ impl Playback {
         Some((devices, steered))
     }
 
+    /// The other device that has playback, which is shown in place of this app's own track.
+    pub fn steered(&self, cx: &App) -> Option<Steered> {
+        self.steering(cx).map(|(_, steered)| steered)
+    }
+
     /// Sends the command `make` builds to the other device that has playback, if one does, and
     /// says whether it did. A caller that got `true` leaves its own engine and queue alone.
     fn steer(&self, make: impl FnOnce(&Steered) -> Command, cx: &App) -> bool {
