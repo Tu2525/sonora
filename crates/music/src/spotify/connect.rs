@@ -946,7 +946,7 @@ fn listed_id(track: &ContextTrack) -> Option<String> {
         return Some(id);
     }
     let gid = track.gid.as_deref().filter(|gid| !gid.is_empty())?;
-    SpotifyId::from_raw(gid).ok()?.to_base62().ok()
+    Some(SpotifyId::from_raw(gid).ok()?.to_base62())
 }
 
 /// The album, playlist or saved tracks a context uri names. Anything else, such as an artist or

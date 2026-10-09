@@ -84,6 +84,12 @@ const SONGS_QUERY: &[(&str, &str)] = &[
     ("fields[library-albums]", "dateAdded"),
 ];
 const CATALOG_QUERY: &[(&str, &str)] = &[("include", "catalog")];
+const ALBUMS_QUERY: &[(&str, &str)] = &[("include", "catalog"), ALBUM_ARTISTS];
+
+/// Asks for the artists behind every album in an answer, nested ones included. Apple otherwise
+/// names them in one string with no id, and a card cannot link to an artist without one. Only
+/// the typed form reaches albums inside a view or under a library row.
+pub(crate) const ALBUM_ARTISTS: (&str, &str) = ("include[albums]", "artists");
 
 /// The listener's pins with everything a sidebar row shows, as the web player asks for them.
 /// The resources come back as one map rather than inline, and a library artist's artwork only
@@ -421,7 +427,9 @@ impl AppleClient {
     /// The account's live recently played shelf, newest first: the albums and playlists the
     /// recent plays came from, read the way the web player's own shelf reads them.
     async fn recent_items(&self) -> Result<Vec<GenreItem>> {
-        let answered = self.get("/me/recent/played", &[("limit", "10")]).await?;
+        let answered = self
+            .get("/me/recent/played", &[("limit", "10"), ALBUM_ARTISTS])
+            .await?;
         Ok(answered
             .get("data")
             .and_then(Value::as_array)
@@ -949,6 +957,7 @@ impl AppleClient {
             ("types", "songs,albums,playlists"),
             ("limit", limit),
             ("include[songs]", "artists,albums"),
+            ALBUM_ARTISTS,
         ];
         if let Some(genre) = genre {
             query.push(("genre", genre));
@@ -975,6 +984,7 @@ impl AppleClient {
                         })
                         .filter_map(|row| match kind {
                             "playlists" => wire::playlist(row).map(GenreItem::Playlist),
+                            "songs" => wire::song(row).map(GenreItem::Track),
                             _ => wire::album(row).map(GenreItem::Album),
                         })
                         .collect()
@@ -1059,7 +1069,12 @@ impl MusicApi for AppleClient {
         let answered = self
             .get(
                 &self.catalog("/search"),
-                &[("term", query), ("types", "albums"), ("limit", &limit)],
+                &[
+                    ("term", query),
+                    ("types", "albums"),
+                    ("limit", &limit),
+                    ALBUM_ARTISTS,
+                ],
             )
             .await?;
         Ok(answered
@@ -1206,12 +1221,12 @@ impl MusicApi for AppleClient {
     }
 
     async fn all_albums(&self) -> Result<Vec<Album>> {
-        self.walk(ALBUMS, PAGE, CATALOG_QUERY, wire::library_album)
+        self.walk(ALBUMS, PAGE, ALBUMS_QUERY, wire::library_album)
             .await
     }
 
     async fn all_albums_paged(&self) -> Result<Pages<Album>> {
-        Ok(self.paged(ALBUMS, PAGE, CATALOG_QUERY, wire::library_album))
+        Ok(self.paged(ALBUMS, PAGE, ALBUMS_QUERY, wire::library_album))
     }
 
     /// Every artist with music in the library. Apple derives this list itself from the songs
@@ -1242,7 +1257,7 @@ impl MusicApi for AppleClient {
     /// the catalog without being added is therefore not here.
     async fn saved_albums(&self) -> Result<Vec<Album>> {
         let albums = self
-            .walk(ALBUMS, PAGE, CATALOG_QUERY, |row| {
+            .walk(ALBUMS, PAGE, ALBUMS_QUERY, |row| {
                 Some((library_id(row)?, wire::library_album(row)?))
             })
             .await?;
@@ -1382,7 +1397,11 @@ impl MusicApi for AppleClient {
         let (path, query): (String, Vec<(&str, &str)>) = match Self::is_mine(album_id) {
             true => (
                 format!("/me/library/albums/{}", escape::component(album_id)),
-                vec![("include", "tracks,catalog")],
+                vec![
+                    ("include", "tracks,catalog"),
+                    ALBUM_ARTISTS,
+                    ("include[songs]", "artists"),
+                ],
             ),
             false => (
                 self.catalog(&format!("/albums/{}", escape::component(album_id))),
@@ -1439,6 +1458,7 @@ impl MusicApi for AppleClient {
                 &[
                     ("views", "top-songs,full-albums,singles"),
                     ("include[songs]", "artists,albums"),
+                    ALBUM_ARTISTS,
                     ("extend", "artistBio"),
                 ],
             )
@@ -1716,7 +1736,9 @@ impl MusicApi for AppleClient {
     /// What Apple made for this listener: their recommendation groups, and the storefront
     /// charts underneath so the page is never empty.
     async fn home(&self) -> Result<HomeFeed> {
-        let answered = self.get("/me/recommendations", &[("limit", "12")]).await?;
+        let answered = self
+            .get("/me/recommendations", &[("limit", "12"), ALBUM_ARTISTS])
+            .await?;
         let mut sections = Vec::new();
         let mut recents = Vec::new();
         for group in answered

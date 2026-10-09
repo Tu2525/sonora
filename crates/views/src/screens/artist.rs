@@ -748,6 +748,7 @@ impl ArtistView {
         }]
         .into_iter()
         .flatten()
+        .map(|rail| div().pt_6().child(rail).into_any_element())
         .collect()
     }
 

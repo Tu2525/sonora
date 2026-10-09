@@ -8,9 +8,9 @@ use ytmusic::YtMusic;
 
 use crate::youtube::{genres, radio, subscriptions, wire};
 use crate::{
-    Album, AlbumCatalogue, AlbumDetail, Artist, ArtistProfile, Feed, Genre, GenreDetail, HomeFeed,
-    MediaKind, MusicApi, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist, Track, UserProfile,
-    escape,
+    Album, AlbumCatalogue, AlbumDetail, Artist, ArtistCatalogue, ArtistProfile, Feed, Genre,
+    GenreDetail, HomeFeed, MediaKind, MusicApi, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist,
+    Track, UserProfile, escape,
 };
 
 const PORTRAIT_LIMIT: usize = 24;
@@ -75,6 +75,20 @@ impl MusicApi for YouTubeClient {
         let mut artist = self.api.artist(artist_id).await?;
         self.hydrate_durations(&mut artist.top_tracks).await;
         Ok(wire::artist(artist))
+    }
+
+    /// The whole discography, since the artist page `artist` reads holds only ten albums and
+    /// ten singles.
+    async fn artist_catalogue(&self, artist_id: &str, _known: &[Track]) -> Result<ArtistCatalogue> {
+        let albums = self
+            .api
+            .discography(artist_id)
+            .await
+            .with_context(|| format!("cannot load the discography of artist {artist_id}"))?;
+        Ok(ArtistCatalogue {
+            albums: albums.into_iter().map(wire::album).collect(),
+            ..ArtistCatalogue::default()
+        })
     }
 
     async fn artist_profile(&self, artist_id: &str) -> Result<ArtistProfile> {

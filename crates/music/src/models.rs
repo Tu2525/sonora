@@ -154,6 +154,18 @@ pub struct Album {
     pub added_at: Option<i64>,
 }
 
+impl Album {
+    /// Credits the album to `artist` when it names no one. A provider calls this on releases
+    /// read from an artist's own listing, which often leaves the artist out of each entry.
+    pub fn credit(mut self, artist: &ArtistRef) -> Self {
+        if self.artists.is_empty() && self.artist_refs.is_empty() && !artist.name.is_empty() {
+            self.artists = artist.name.clone();
+            self.artist_refs = vec![artist.clone()];
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlbumDetail {
     pub album: Album,

@@ -13,7 +13,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Spotify and Discord show what you play in it. Your phone can pause, skip, seek, change the
   volume and start music in Sonora.
 - A devices button in the player bar moves playback between Sonora and your other Spotify
-  devices and controls the one that is playing.
+  devices. While another device plays, the player bar and lyrics follow its song, and Sonora's
+  controls and the songs you pick play there, the way Spotify's own apps do.
+
+### Changed
+
+- On Windows, the minimize, maximize, restore and close buttons now use Windows' own icons, so
+  they match other Windows apps.
+
+### Fixed
+
+- YouTube Music and Apple Music artist pages now list the artist's whole discography instead
+  of stopping at ten albums and ten singles, and Deezer artist pages no longer stop at 50.
+- Albums on YouTube Music and Deezer artist pages now name the artist, and a card with no
+  artist to show no longer ends its line in a stray dot.
+- Artist names on Apple Music album cards now open the artist, in search, charts, home, the
+  library and on artist pages.
+- Top songs on Apple Music charts now show and play as songs instead of album cards.
+- The Appears on row of an artist page no longer sits flush against the Show all button.
+- Seeking in the last few seconds of a song now moves within that song, instead of jumping into
+  the next one or doing nothing.
+- Signing in to Spotify on Windows on ARM no longer fails with "Spotify turned down the
+  sign-in".
 
 ## [0.42.2] - 2026-10-07
 
