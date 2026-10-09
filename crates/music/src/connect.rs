@@ -121,6 +121,8 @@ pub struct Elsewhere {
     pub position: Duration,
     pub stamp: SystemTime,
     pub duration: Duration,
+    pub shuffle: bool,
+    pub repeat: RepeatMode,
 }
 
 impl Elsewhere {

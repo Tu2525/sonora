@@ -45,6 +45,8 @@ pub struct Steered {
     /// How far into the track it is now.
     pub position: Duration,
     pub duration: Duration,
+    pub shuffle: bool,
+    pub repeat: Repeat,
 }
 
 /// The provider's device network as the app sees it: this app listed as a device, playback
@@ -175,6 +177,8 @@ impl Devices {
             playing: elsewhere.playing,
             position: elsewhere.live_position(),
             duration,
+            shuffle: elsewhere.shuffle,
+            repeat: repeat_of(elsewhere.repeat),
         })
     }
 
@@ -391,16 +395,9 @@ impl Devices {
             Command::Seek(at) => self.here(cx, |playback, cx| playback.seek(at, cx)),
             Command::Volume(level) => self.here(cx, |playback, cx| playback.set_volume(level, cx)),
             Command::Shuffle(on) => self.queue.update(cx, |queue, cx| queue.set_shuffle(on, cx)),
-            Command::Repeat(mode) => self.here(cx, |playback, cx| {
-                playback.set_repeat(
-                    match mode {
-                        RepeatMode::Off => Repeat::Off,
-                        RepeatMode::Context => Repeat::All,
-                        RepeatMode::Track => Repeat::One,
-                    },
-                    cx,
-                )
-            }),
+            Command::Repeat(mode) => {
+                self.here(cx, |playback, cx| playback.set_repeat(repeat_of(mode), cx))
+            }
             Command::Enqueue(id) => self.enqueue(id, cx),
             Command::Start(start) => self.start(start, cx),
             Command::Released => {
@@ -543,12 +540,26 @@ impl Devices {
             duration: track.duration,
             volume: playback.volume(),
             shuffle: queue.shuffle(),
-            repeat: match playback.repeat() {
-                Repeat::Off => RepeatMode::Off,
-                Repeat::All => RepeatMode::Context,
-                Repeat::One => RepeatMode::Track,
-            },
+            repeat: mode_of(playback.repeat()),
         })
+    }
+}
+
+/// The repeat setting the device network names `mode`.
+fn repeat_of(mode: RepeatMode) -> Repeat {
+    match mode {
+        RepeatMode::Off => Repeat::Off,
+        RepeatMode::Context => Repeat::All,
+        RepeatMode::Track => Repeat::One,
+    }
+}
+
+/// The device network's name for the repeat setting `repeat`.
+pub(crate) fn mode_of(repeat: Repeat) -> RepeatMode {
+    match repeat {
+        Repeat::Off => RepeatMode::Off,
+        Repeat::All => RepeatMode::Context,
+        Repeat::One => RepeatMode::Track,
     }
 }
 

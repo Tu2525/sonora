@@ -661,6 +661,15 @@ impl Worker {
                     position: millis(state.position_as_of_timestamp),
                     stamp: UNIX_EPOCH + millis(state.timestamp),
                     duration: millis(state.duration),
+                    shuffle: state.options.shuffling_context,
+                    repeat: match (
+                        state.options.repeating_track,
+                        state.options.repeating_context,
+                    ) {
+                        (true, _) => RepeatMode::Track,
+                        (false, true) => RepeatMode::Context,
+                        (false, false) => RepeatMode::Off,
+                    },
                 }
             });
         Roster { devices, elsewhere }
@@ -861,6 +870,12 @@ fn wire_command(command: &Command) -> Option<serde_json::Value> {
         Command::Shuffle(on) => {
             serde_json::json!({ "endpoint": "set_shuffling_context", "value": on })
         }
+        Command::Repeat(mode) => serde_json::json!({
+            "endpoint": "set_options",
+            "repeating_context": *mode != RepeatMode::Off,
+            "repeating_track": *mode == RepeatMode::Track,
+            "logging_params": {},
+        }),
         _ => return None,
     })
 }

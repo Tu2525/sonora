@@ -89,7 +89,7 @@ impl QueuePlacement {
 use crate::queue::Queue;
 use serde::{Deserialize, Serialize};
 
-use crate::devices::collection_of;
+use crate::devices::{collection_of, mode_of};
 use crate::{
     AppSettings, Devices, Io, Network, Outcome, Session, SessionEvent, Steered, Target, Toasts,
     join,
@@ -574,6 +574,27 @@ impl Playback {
     /// The other device that has playback, which is shown in place of this app's own track.
     pub fn steered(&self, cx: &App) -> Option<Steered> {
         self.steering(cx).map(|(_, steered)| steered)
+    }
+
+    /// The track the player shows: the other device's while one is steered, else this app's own.
+    pub fn shown_track(&self, cx: &App) -> Option<Track> {
+        match self.steered(cx) {
+            Some(steered) => steered.track,
+            None => self.track.clone(),
+        }
+    }
+
+    /// How far into the shown track playback is, and how long that track is.
+    pub fn shown_time(&self, cx: &App) -> (Duration, Duration) {
+        match self.steered(cx) {
+            Some(steered) => (steered.position, steered.duration),
+            None => (
+                self.position,
+                self.track
+                    .as_ref()
+                    .map_or(Duration::ZERO, |track| track.duration),
+            ),
+        }
     }
 
     /// Sends the command `make` builds to the other device that has playback, if one does, and
@@ -1596,6 +1617,9 @@ impl Playback {
 
     /// Switches the repeat mode and remembers it in settings.
     pub fn set_repeat(&mut self, repeat: Repeat, cx: &mut Context<Self>) {
+        if self.steer(|_| Command::Repeat(mode_of(repeat)), cx) {
+            return;
+        }
         if self.repeat == repeat {
             return;
         }
@@ -1606,7 +1630,7 @@ impl Playback {
     }
 
     pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
-        let repeat = match self.repeat {
+        let repeat = match self.shown_repeat(cx) {
             Repeat::Off => Repeat::All,
             Repeat::All => Repeat::One,
             Repeat::One => Repeat::Off,
@@ -1617,11 +1641,37 @@ impl Playback {
     /// A binary on/off flip for surfaces (tray, dock menu) that do not fit the three-way
     /// cycle the player bar's button drives; `One` counts as on and flips straight to `Off`.
     pub fn toggle_repeat(&mut self, cx: &mut Context<Self>) {
-        let repeat = match self.repeat {
+        let repeat = match self.shown_repeat(cx) {
             Repeat::Off => Repeat::All,
             Repeat::All | Repeat::One => Repeat::Off,
         };
         self.set_repeat(repeat, cx);
+    }
+
+    /// The repeat setting of the device that has playback, which is this app's own unless
+    /// another device is being steered.
+    pub fn shown_repeat(&self, cx: &App) -> Repeat {
+        self.steered(cx)
+            .map_or(self.repeat, |steered| steered.repeat)
+    }
+
+    /// Turns shuffle on or off, on the other device when one has playback.
+    pub fn set_shuffle(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.steer(|_| Command::Shuffle(on), cx) {
+            return;
+        }
+        self.queue.update(cx, |queue, cx| queue.set_shuffle(on, cx));
+    }
+
+    pub fn toggle_shuffle(&mut self, cx: &mut Context<Self>) {
+        self.set_shuffle(!self.shown_shuffle(cx), cx);
+    }
+
+    /// Whether the device that has playback shuffles, which is this app's queue unless another
+    /// device is being steered.
+    pub fn shown_shuffle(&self, cx: &App) -> bool {
+        self.steered(cx)
+            .map_or_else(|| self.queue.read(cx).shuffle(), |steered| steered.shuffle)
     }
 
     /// Decides what follows a track that ended: the same one on repeat-one, the queue's start
@@ -2110,17 +2160,6 @@ impl Playback {
 
     pub fn track(&self) -> Option<&Track> {
         self.track.as_ref()
-    }
-
-    /// How far through the track `position` is, from 0 to 1.
-    pub fn progress(&self) -> f32 {
-        let Some(total) = self.track.as_ref().map(|track| track.duration) else {
-            return 0.;
-        };
-        if total.is_zero() {
-            return 0.;
-        }
-        (self.position.as_secs_f32() / total.as_secs_f32()).clamp(0., 1.)
     }
 
     pub fn is_loading(&self) -> bool {
